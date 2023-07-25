@@ -1,5 +1,5 @@
 [package]
-name = "wavefornt-aln"
+name = "wavefront-aln"
 version = "0.1.0"
 edition = "2021"
 
