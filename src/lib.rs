@@ -166,7 +166,7 @@ impl<'a> WaveFronts<'a> {
                     (k - 1, *y2, AlnLayer::Insert),
                 )),
                 (Some(y1), Some(y2)) => {
-                    if *y1 >= *y2 {
+                    if *y1 > *y2 {
                         Some((
                             (k, *y1 + 1, AlnLayer::Insert),
                             (k - 1, *y1, AlnLayer::Match),
@@ -273,7 +273,7 @@ impl<'a> WaveFronts<'a> {
                 (Some(y1), Some(y2), Some(y3)) => {
                     if *y1 + 1 >= *y2 && *y1 + 1 >= *y3 {
                         Some(((k, *y1 + 1, AlnLayer::Match), (k, *y1, AlnLayer::Match)))
-                    } else if *y2 >= *y3 {
+                    } else if *y2 > *y3 {
                         Some(((k, *y2, AlnLayer::Match), (k, *y2, AlnLayer::Insert)))
                     } else {
                         Some(((k, *y3, AlnLayer::Match), (k, *y3, AlnLayer::Delete)))
@@ -312,6 +312,9 @@ impl<'a> WaveFronts<'a> {
                 debug!("query: {} y: {}\n", self.query_str.len(), y);
                 let dy = self.query_str.len() - y;
                 let x = (y as i32 - k) as usize;
+                if x > self.target_str.len() {
+                    return;
+                }
                 let dx = self.target_str.len() - x;
                 let max_d = max(dx, dy);
                 kdist.insert(k, max_d);
@@ -469,11 +472,11 @@ mod tests {
 
     #[test]
     fn test_step() {
-        //use simple_logger::SimpleLogger;
-        //SimpleLogger::new().init().unwrap();
+        use simple_logger::SimpleLogger;
+        SimpleLogger::new().init().unwrap();
         let t_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAATACATGAAAGTTGCATGAAACATACATGAAAAAAGTTGCATGAAACCCCATACATGAAAGTTGCATGAA";
         let q_str = "ACATACATGAAAAAAGTTGCATGAAAAAACATACATGAAAGTTGCATGAAACATACATGAAAAAAGTTGCAAAAGTTGCATGAAACATACATGAAAATGAAAAAACATACATGAAAGTTGCATGAA";
-        let mut wfs = WaveFronts::new(t_str, q_str, 20, 4, 2, 1);
+        let mut wfs = WaveFronts::new(t_str, q_str, 40, 2, 2, 1);
         wfs.step_all();
         let (t_aln_str, q_aln_str) = wfs.backtrace();
         println!("{}", t_aln_str);
