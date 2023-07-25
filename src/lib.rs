@@ -166,7 +166,7 @@ impl<'a> WaveFronts<'a> {
                     (k - 1, *y2, AlnLayer::Insert),
                 )),
                 (Some(y1), Some(y2)) => {
-                    if *y1 > *y2 {
+                    if *y1 >= *y2 {
                         Some((
                             (k, *y1 + 1, AlnLayer::Insert),
                             (k - 1, *y1, AlnLayer::Match),
@@ -210,7 +210,7 @@ impl<'a> WaveFronts<'a> {
                     Some(((k, *y2, AlnLayer::Delete), (k + 1, *y2, AlnLayer::Delete)))
                 }
                 (Some(y1), Some(y2)) => {
-                    if *y1 > *y2 {
+                    if *y1 >= *y2 {
                         Some(((k, *y1, AlnLayer::Delete), (k + 1, *y1, AlnLayer::Match)))
                     } else {
                         Some(((k, *y2, AlnLayer::Delete), (k + 1, *y2, AlnLayer::Delete)))
@@ -249,21 +249,21 @@ impl<'a> WaveFronts<'a> {
                 }
 
                 (Some(y1), Some(y2), None) => {
-                    if *y1 + 1 > *y2 {
+                    if *y1 + 1 >= *y2 {
                         Some(((k, *y1 + 1, AlnLayer::Match), (k, *y1, AlnLayer::Match)))
                     } else {
                         Some(((k, *y2, AlnLayer::Match), (k, *y2, AlnLayer::Insert)))
                     }
                 }
                 (Some(y1), None, Some(y3)) => {
-                    if *y1 + 1 > *y3 {
+                    if *y1 + 1 >= *y3 {
                         Some(((k, *y1 + 1, AlnLayer::Match), (k, *y1, AlnLayer::Match)))
                     } else {
                         Some(((k, *y3, AlnLayer::Match), (k, *y3, AlnLayer::Delete)))
                     }
                 }
                 (None, Some(y2), Some(y3)) => {
-                    if *y2 > *y3 {
+                    if *y2 >= *y3 {
                         Some(((k, *y2, AlnLayer::Match), (k, *y2, AlnLayer::Insert)))
                     } else {
                         Some(((k, *y3, AlnLayer::Match), (k, *y3, AlnLayer::Delete)))
@@ -271,9 +271,9 @@ impl<'a> WaveFronts<'a> {
                 }
 
                 (Some(y1), Some(y2), Some(y3)) => {
-                    if *y1 + 1 > *y2 && *y1 + 1 > *y3 {
+                    if *y1 + 1 >= *y2 && *y1 + 1 >= *y3 {
                         Some(((k, *y1 + 1, AlnLayer::Match), (k, *y1, AlnLayer::Match)))
-                    } else if *y2 > *y3 {
+                    } else if *y2 >= *y3 {
                         Some(((k, *y2, AlnLayer::Match), (k, *y2, AlnLayer::Insert)))
                     } else {
                         Some(((k, *y3, AlnLayer::Match), (k, *y3, AlnLayer::Delete)))
@@ -473,7 +473,7 @@ mod tests {
         //SimpleLogger::new().init().unwrap();
         let t_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAATACATGAAAGTTGCATGAAACATACATGAAAAAAGTTGCATGAAACCCCATACATGAAAGTTGCATGAA";
         let q_str = "ACATACATGAAAAAAGTTGCATGAAAAAACATACATGAAAGTTGCATGAAACATACATGAAAAAAGTTGCAAAAGTTGCATGAAACATACATGAAAATGAAAAAACATACATGAAAGTTGCATGAA";
-        let mut wfs = WaveFronts::new(t_str, q_str, 20, 1, 1, 1);
+        let mut wfs = WaveFronts::new(t_str, q_str, 20, 4, 2, 1);
         wfs.step_all();
         let (t_aln_str, q_aln_str) = wfs.backtrace();
         println!("{}", t_aln_str);
