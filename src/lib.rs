@@ -26,10 +26,10 @@ pub struct WaveFronts<'a> {
     pub open_penalty: i32,
     pub extension_penalty: i32,
     pub score: i32,
-    pub backtrace_map: FxHashMap<(i32, u32, AlnLayer), (i32, u32, AlnLayer)>,
+    pub backtrace_map: FxHashMap<(i32, u32, AlnLayer), ((i32, u32, AlnLayer), i32)>,
 }
 type Anchor = (i32, u32, AlnLayer);
-type Connection = (Anchor, Anchor);
+type Connection = (Anchor, Anchor); // Connection.0 is the best score at the end point
 
 impl WaveFront {
     fn new() -> Self {
@@ -38,7 +38,7 @@ impl WaveFront {
         wf
     }
 
-    fn advance<'a>(&mut self, t: &'a str, q: &'a str, score: i32) -> Vec<Connection> {
+    fn advance<'a>(&mut self, t: &'a str, q: &'a str, score: i32) -> Vec<(Connection, i32)> {
         debug!("advance score: {}", score);
         let q = q.as_bytes();
         let t = t.as_bytes();
@@ -59,7 +59,10 @@ impl WaveFront {
                     if ys > y as usize {
                         self.s_k_to_y_map.insert((score, k), ys as u32);
 
-                        Some(((k, ys as u32, AlnLayer::Match), (k, y, AlnLayer::Match)))
+                        Some((
+                            ((k, ys as u32, AlnLayer::Match), (k, y, AlnLayer::Match)),
+                            score,
+                        ))
                     } else {
                         None
                     }
@@ -157,21 +160,25 @@ impl<'a> WaveFronts<'a> {
 
             let connection = match (e1, e2) {
                 (Some(y1), None) => Some((
+                    score,
                     (k, *y1 + 1, AlnLayer::Insert),
                     (k - 1, *y1, AlnLayer::Match),
                 )),
                 (None, Some(y2)) => Some((
+                    score,
                     (k, *y2 + 1, AlnLayer::Insert),
                     (k - 1, *y2, AlnLayer::Insert),
                 )),
                 (Some(y1), Some(y2)) => {
                     if *y1 >= *y2 {
                         Some((
+                            score,
                             (k, *y1 + 1, AlnLayer::Insert),
                             (k - 1, *y1, AlnLayer::Match),
                         ))
                     } else {
                         Some((
+                            score,
                             (k, *y2 + 1, AlnLayer::Insert),
                             (k - 1, *y2, AlnLayer::Insert),
                         ))
@@ -180,12 +187,18 @@ impl<'a> WaveFronts<'a> {
                 (None, None) => None,
             };
 
-            if let Some((connection_to, connection_from)) = connection {
+            if let Some((score, connection_to, connection_from)) = connection {
                 self.insertion_layer
                     .s_k_to_y_map
                     .insert((score, k), connection_to.1);
-                if self.backtrace_map.get(&connection_to).is_none() {
-                    self.backtrace_map.insert(connection_to, connection_from);
+                let e = self
+                    .backtrace_map
+                    .entry(connection_to.clone())
+                    .or_insert((connection_from.clone(), score));
+                if e.1 > score {
+                    assert!(connection_to != connection_from);
+                    self.backtrace_map
+                        .insert(connection_to, (connection_from, score));
                 }
             };
 
@@ -223,8 +236,14 @@ impl<'a> WaveFronts<'a> {
                 self.deletion_layer
                     .s_k_to_y_map
                     .insert((score, k), connection_to.1);
-                if self.backtrace_map.get(&connection_to).is_none() {
-                    self.backtrace_map.insert(connection_to, connection_from);
+                let e = self
+                    .backtrace_map
+                    .entry(connection_to.clone())
+                    .or_insert((connection_from.clone(), score));
+                if e.1 > score {
+                    assert!(connection_to != connection_from);
+                    self.backtrace_map
+                        .insert(connection_to, (connection_from, score));
                 }
             };
 
@@ -289,7 +308,15 @@ impl<'a> WaveFronts<'a> {
                     self.match_layer
                         .s_k_to_y_map
                         .insert((score, k), connection_to.1);
-                    self.backtrace_map.insert(connection_to, connection_from);
+                    let e = self
+                        .backtrace_map
+                        .entry(connection_to.clone())
+                        .or_insert((connection_from.clone(), score));
+                    if e.1 > score {
+                        assert!(connection_to != connection_from);
+                        self.backtrace_map
+                            .insert(connection_to, (connection_from, score));
+                    }
                 }
             };
         })
@@ -387,13 +414,15 @@ impl<'a> WaveFronts<'a> {
         self.match_layer
             .advance(self.target_str, self.query_str, self.score)
             .into_iter()
-            .for_each(|(connection_to, connection_from)| {
+            .for_each(|((connection_to, connection_from), score)| {
                 if let Some(e) = self.backtrace_map.get(&connection_to) {
-                    if connection_from.1 <= e.1 {
-                        self.backtrace_map.insert(connection_to, connection_from);
+                    if score < e.1 {
+                        self.backtrace_map
+                            .insert(connection_to, (connection_from, score));
                     }
                 } else {
-                    self.backtrace_map.insert(connection_to, connection_from);
+                    self.backtrace_map
+                        .insert(connection_to, (connection_from, score));
                 }
             });
         debug!("backtrack_map: {:?}", self.backtrace_map.clone());
@@ -434,7 +463,8 @@ impl<'a> WaveFronts<'a> {
         debug!("seed: {:?}", connect_to);
         anchors.push(connect_to.clone());
         while let Some(connect_from) = self.backtrace_map.get(&connect_to) {
-            connect_to = connect_from.clone();
+            assert!(connect_from.0 != connect_to);
+            connect_to = connect_from.clone().0;
             anchors.push(connect_to.clone());
         }
         anchors.reverse();
@@ -484,7 +514,7 @@ mod tests {
         SimpleLogger::new().init().unwrap();
         let t_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAATACATGAAAGTTGCATGAAACATACATGAAAAAAGTTGCATGAAACCCCATACATGAAAGTTGCATGAA";
         let q_str = "ACATACATGAAAAAAGTTGCATGAAAAAACATACATGAAAGTTGCATGAAACATACATGAAAAAAGTTGCAAAAGTTGCATGAAACATACATGAAAATGAAAAAACATACATGAAAGTTGCATGAA";
-        let mut wfs = WaveFronts::new(t_str, q_str, 40, 30, 3, 1);
+        let mut wfs = WaveFronts::new(t_str, q_str, 40, 2, 2, 1);
         wfs.step_all();
         let (t_aln_str, q_aln_str) = wfs.backtrace();
         println!("{}", t_aln_str);
