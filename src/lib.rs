@@ -38,6 +38,17 @@ impl WaveFront {
         wf
     }
 
+    fn new_with_capacity(capacity: usize) -> Self {
+        let s_k_to_y_map = FxHashMap::with_capacity_and_hasher(capacity * 64, Default::default());
+        let score_to_k_range = FxHashMap::with_capacity_and_hasher(capacity, Default::default());
+        let mut wf = WaveFront {
+            s_k_to_y_map,
+            score_to_k_range
+        };
+        wf.score_to_k_range.insert(0, (0, 1));
+        wf
+    }
+
     fn advance<'a>(&mut self, t: &'a str, q: &'a str, score: i32) -> Vec<(Connection, i32)> {
         debug!("advance score: {}", score);
         let q = q.as_bytes();
@@ -86,6 +97,35 @@ impl<'a> WaveFronts<'a> {
         let insertion_layer = WaveFront::new();
         let deletion_layer = WaveFront::new();
         let mut match_layer = WaveFront::new();
+        match_layer.s_k_to_y_map.insert((0, 0), 0);
+
+        WaveFronts {
+            target_str: t_str,
+            query_str: q_str,
+            insertion_layer,
+            deletion_layer,
+            match_layer,
+            min_wf_length,
+            mismatch_penalty,
+            open_penalty,
+            extension_penalty,
+            score: 0,
+            backtrace_map: FxHashMap::default(),
+        }
+    }
+
+    pub fn new_with_capacity(
+        t_str: &'a str,
+        q_str: &'a str,
+        min_wf_length: u32,
+        mismatch_penalty: i32,
+        open_penalty: i32,
+        extension_penalty: i32,
+        capacity: usize
+    ) -> Self {
+        let insertion_layer = WaveFront::new_with_capacity(capacity);
+        let deletion_layer = WaveFront::new_with_capacity(capacity);
+        let mut match_layer = WaveFront::new_with_capacity(capacity);
         match_layer.s_k_to_y_map.insert((0, 0), 0);
 
         WaveFronts {
@@ -514,7 +554,7 @@ mod tests {
         SimpleLogger::new().init().unwrap();
         let t_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAATACATGAAAGTTGCATGAAACATACATGAAAAAAGTTGCATGAAACCCCATACATGAAAGTTGCATGAA";
         let q_str = "ACATACATGAAAAAAGTTGCATGAAAAAACATACATGAAAGTTGCATGAAACATACATGAAAAAAGTTGCAAAAGTTGCATGAAACATACATGAAAATGAAAAAACATACATGAAAGTTGCATGAA";
-        let mut wfs = WaveFronts::new(t_str, q_str, 40, 2, 2, 1);
+        let mut wfs = WaveFronts::new_with_capacity(t_str, q_str, 40, 2, 2, 1, t_str.len() >> 4);
         wfs.step_all();
         let (t_aln_str, q_aln_str) = wfs.backtrace();
         println!("{}", t_aln_str);
