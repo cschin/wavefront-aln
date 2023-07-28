@@ -508,9 +508,7 @@ impl<'a> WaveFronts<'a> {
 
     pub fn backtrace(&mut self) -> (String, String) {
         let mut anchors = Vec::<Anchor>::new();
-        self.backtrace_map.iter().for_each(|(k, v)| {
-            println!("{:?} {:?}", k, v);
-        });
+
         let mut connect_to = (
             self.query_str.len() as i32 - self.target_str.len() as i32,
             self.query_str.len() as u32,
@@ -522,7 +520,6 @@ impl<'a> WaveFronts<'a> {
             self.target_str.len(),
             self.query_str.len()
         );
-        println!("seed: {:?}", connect_to);
         anchors.push(connect_to.clone());
         while let Some(connect_from) = self.backtrace_map.get(&connect_to) {
             assert!(connect_from.0 != connect_to);
