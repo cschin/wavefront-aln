@@ -228,17 +228,21 @@ impl<'a> WaveFronts<'a> {
             };
 
             if let Some((score, connection_to, connection_from)) = connection {
-                self.insertion_layer
-                    .s_k_to_y_map
-                    .insert((score, k), connection_to.1);
-                let e = self
-                    .backtrace_map
-                    .entry(connection_to.clone())
-                    .or_insert((connection_from.clone(), score));
-                if e.1 > score {
-                    assert!(connection_to != connection_from);
-                    self.backtrace_map
-                        .insert(connection_to, (connection_from, score));
+                let x = (connection_to.1 as i32 - connection_to.0) as usize;
+                let y = connection_to.1 as usize;
+                if x < self.target_str.len() && y < self.query_str.len() {
+                    self.insertion_layer
+                        .s_k_to_y_map
+                        .insert((score, k), connection_to.1);
+                    let e = self
+                        .backtrace_map
+                        .entry(connection_to.clone())
+                        .or_insert((connection_from.clone(), score));
+                    if e.1 > score {
+                        assert!(connection_to != connection_from);
+                        self.backtrace_map
+                            .insert(connection_to, (connection_from, score));
+                    }
                 }
             };
 
@@ -273,17 +277,21 @@ impl<'a> WaveFronts<'a> {
             };
 
             if let Some((connection_to, connection_from)) = connection {
-                self.deletion_layer
-                    .s_k_to_y_map
-                    .insert((score, k), connection_to.1);
-                let e = self
-                    .backtrace_map
-                    .entry(connection_to.clone())
-                    .or_insert((connection_from.clone(), score));
-                if e.1 > score {
-                    assert!(connection_to != connection_from);
-                    self.backtrace_map
-                        .insert(connection_to, (connection_from, score));
+                let x = (connection_to.1 as i32 - connection_to.0) as usize;
+                let y = connection_to.1 as usize;
+                if x < self.target_str.len() && y < self.query_str.len() {
+                    self.deletion_layer
+                        .s_k_to_y_map
+                        .insert((score, k), connection_to.1);
+                    let e = self
+                        .backtrace_map
+                        .entry(connection_to.clone())
+                        .or_insert((connection_from.clone(), score));
+                    if e.1 > score {
+                        assert!(connection_to != connection_from);
+                        self.backtrace_map
+                            .insert(connection_to, (connection_from, score));
+                    }
                 }
             };
 
@@ -345,17 +353,22 @@ impl<'a> WaveFronts<'a> {
 
             if let Some((connection_to, connection_from)) = connection {
                 if self.backtrace_map.get(&connection_to).is_none() {
-                    self.match_layer
-                        .s_k_to_y_map
-                        .insert((score, k), connection_to.1);
-                    let e = self
-                        .backtrace_map
-                        .entry(connection_to.clone())
-                        .or_insert((connection_from.clone(), score));
-                    if e.1 > score {
-                        assert!(connection_to != connection_from);
-                        self.backtrace_map
-                            .insert(connection_to, (connection_from, score));
+                    let x = (connection_to.1 as i32 - connection_to.0) as usize;
+                    let y = connection_to.1 as usize;
+                    if x < self.target_str.len() && y < self.query_str.len() {
+                        self.match_layer
+                            .s_k_to_y_map
+                            .insert((score, k), connection_to.1);
+                        let e = self
+                            .backtrace_map
+                            .entry(connection_to.clone())
+                            .or_insert((connection_from.clone(), score));
+
+                        if e.1 > score {
+                            assert!(connection_to != connection_from);
+                            self.backtrace_map
+                                .insert(connection_to, (connection_from, score));
+                        }
                     }
                 }
             };
@@ -495,12 +508,21 @@ impl<'a> WaveFronts<'a> {
 
     pub fn backtrace(&mut self) -> (String, String) {
         let mut anchors = Vec::<Anchor>::new();
+        self.backtrace_map.iter().for_each(|(k, v)| {
+            println!("{:?} {:?}", k, v);
+        });
         let mut connect_to = (
             self.query_str.len() as i32 - self.target_str.len() as i32,
             self.query_str.len() as u32,
             AlnLayer::Match,
         );
-        debug!("seed: {:?}", connect_to);
+        debug!(
+            "seed: {:?} {} {}",
+            connect_to,
+            self.target_str.len(),
+            self.query_str.len()
+        );
+        println!("seed: {:?}", connect_to);
         anchors.push(connect_to.clone());
         while let Some(connect_from) = self.backtrace_map.get(&connect_to) {
             assert!(connect_from.0 != connect_to);
@@ -508,6 +530,7 @@ impl<'a> WaveFronts<'a> {
             anchors.push(connect_to.clone());
         }
         anchors.reverse();
+        debug!("anchors length: {:?}", anchors.len());
         let t_str = self.target_str.to_string();
         let q_str = self.query_str.to_string();
         let mut t_aln_str = Vec::<&str>::new();
@@ -520,8 +543,8 @@ impl<'a> WaveFronts<'a> {
                 let x = (y as i32 - k) as usize;
                 let y = y as usize;
                 debug!(
-                    "connection: {} {} {:?} -> {} {} {:?}",
-                    px, py, pl, x, y, layer
+                    "connection: {} {} {:?} -> {} {} {:?} ( {}, {} -> {}, {} )",
+                    px, py, pl, x, y, layer, pk, py, k, y
                 );
                 if x > px || y > py {
                     if x > px {
@@ -554,6 +577,19 @@ mod tests {
         SimpleLogger::new().init().unwrap();
         let t_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAATACATGAAAGTTGCATGAAACATACATGAAAAAAGTTGCATGAAACCCCATACATGAAAGTTGCATGAA";
         let q_str = "ACATACATGAAAAAAGTTGCATGAAAAAACATACATGAAAGTTGCATGAAACATACATGAAAAAAGTTGCAAAAGTTGCATGAAACATACATGAAAATGAAAAAACATACATGAAAGTTGCATGAA";
+        let mut wfs = WaveFronts::new_with_capacity(t_str, q_str, 40, 2, 2, 1, t_str.len() >> 4);
+        wfs.step_all();
+        let (t_aln_str, q_aln_str) = wfs.backtrace();
+        println!("{}", t_aln_str);
+        println!("{}", q_aln_str);
+    }
+
+    #[test]
+    fn test_step_2() {
+        use simple_logger::SimpleLogger;
+        SimpleLogger::new().init().unwrap();
+        let t_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAAAAAATGAAAGTTGCATGAA";
+        let q_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAAATGAAAGTAAAATGAAAGTTGCATGAATGCATACATGAAAGTTGCA";
         let mut wfs = WaveFronts::new_with_capacity(t_str, q_str, 40, 2, 2, 1, t_str.len() >> 4);
         wfs.step_all();
         let (t_aln_str, q_aln_str) = wfs.backtrace();
