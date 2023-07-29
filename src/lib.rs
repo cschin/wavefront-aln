@@ -21,7 +21,7 @@ pub struct WaveFronts<'a> {
     insertion_layer: WaveFront,
     deletion_layer: WaveFront,
     match_layer: WaveFront,
-    pub min_wf_length: u32,
+    pub max_wf_length: u32,
     pub mismatch_penalty: i32,
     pub open_penalty: i32,
     pub extension_penalty: i32,
@@ -105,7 +105,7 @@ impl<'a> WaveFronts<'a> {
             insertion_layer,
             deletion_layer,
             match_layer,
-            min_wf_length,
+            max_wf_length: min_wf_length,
             mismatch_penalty,
             open_penalty,
             extension_penalty,
@@ -134,7 +134,7 @@ impl<'a> WaveFronts<'a> {
             insertion_layer,
             deletion_layer,
             match_layer,
-            min_wf_length,
+            max_wf_length: min_wf_length,
             mismatch_penalty,
             open_penalty,
             extension_penalty,
@@ -193,10 +193,6 @@ impl<'a> WaveFronts<'a> {
                 .insertion_layer
                 .s_k_to_y_map
                 .get(&(score - self.extension_penalty, k - 1));
-            debug!(
-                "I {:?} {:?} {:?}",
-                e1, e2, &self.insertion_layer.s_k_to_y_map
-            );
 
             let connection = match (e1, e2) {
                 (Some(y1), None) => Some((
@@ -255,10 +251,6 @@ impl<'a> WaveFronts<'a> {
                 .deletion_layer
                 .s_k_to_y_map
                 .get(&(score - self.extension_penalty, k + 1));
-            debug!(
-                "D {:?} {:?} {:?}",
-                e1, e2, &self.deletion_layer.s_k_to_y_map
-            );
             let connection = match (e1, e2) {
                 (Some(y1), None) => {
                     Some(((k, *y1, AlnLayer::Delete), (k + 1, *y1, AlnLayer::Match)))
@@ -301,10 +293,6 @@ impl<'a> WaveFronts<'a> {
                 .get(&(score - self.mismatch_penalty, k));
             let e2 = self.insertion_layer.s_k_to_y_map.get(&(score, k));
             let e3 = self.deletion_layer.s_k_to_y_map.get(&(score, k));
-            debug!(
-                "M {:?} {:?} {:?} {:?}",
-                e1, e2, e3, &self.match_layer.s_k_to_y_map
-            );
             let connection = match (e1, e2, e3) {
                 (Some(y1), None, None) => {
                     Some(((k, *y1 + 1, AlnLayer::Match), (k, *y1, AlnLayer::Match)))
@@ -378,7 +366,7 @@ impl<'a> WaveFronts<'a> {
     fn reduce(&mut self) {
         let (kmin, kmax) = *self.match_layer.score_to_k_range.get(&self.score).unwrap();
         debug!("reduce, kmin-kmax: ({}):({}), {}", kmin, kmax, kmax - kmin);
-        if (kmax - kmin) as u32 > self.min_wf_length {
+        if (kmax - kmin) as u32 > self.max_wf_length {
             let mut dmin = usize::MAX;
             let mut kdist = FxHashMap::<i32, usize>::default();
 
@@ -404,24 +392,24 @@ impl<'a> WaveFronts<'a> {
             });
 
             let mut new_kmin = kmin;
-            while new_kmin < kmax {
+            while new_kmin < kmax - 1 {
                 if !kdist.contains_key(&new_kmin) {
                     new_kmin += 1;
                     continue;
                 }
-                if *kdist.get(&new_kmin).unwrap() - dmin <= self.min_wf_length as usize {
+                if *kdist.get(&new_kmin).unwrap() - dmin <= self.max_wf_length as usize {
                     break;
                 }
                 new_kmin += 1;
             }
 
             let mut new_kmax = kmax;
-            while new_kmax > new_kmin {
+            while new_kmax > new_kmin + 1 {
                 if !kdist.contains_key(&new_kmax) {
                     new_kmax -= 1;
                     continue;
                 }
-                if *kdist.get(&new_kmax).unwrap() - dmin <= self.min_wf_length as usize {
+                if *kdist.get(&new_kmax).unwrap() - dmin <= self.max_wf_length as usize {
                     break;
                 }
                 new_kmax -= 1;
@@ -478,8 +466,8 @@ impl<'a> WaveFronts<'a> {
                         .insert(connection_to, (connection_from, score));
                 }
             });
-        debug!("backtrack_map: {:?}", self.backtrace_map.clone());
-        debug!("match wf 0: {:?}", self.match_layer.s_k_to_y_map.clone());
+        // debug!("backtrack_map: {:?}", self.backtrace_map.clone());
+        // debug!("match wf 0: {:?}", self.match_layer.s_k_to_y_map.clone());
         if let Some(y) = self.match_layer.s_k_to_y_map.get(&(
             self.score,
             self.query_str.len() as i32 - self.target_str.len() as i32,
@@ -492,8 +480,17 @@ impl<'a> WaveFronts<'a> {
         self.score += 1;
         self.next(self.score);
         self.reduce();
+        let (k_min, k_max) = self.match_layer.score_to_k_range.get(&self.score).unwrap();
+        debug!(
+            "k_min, k_max: {} {} {}",
+            k_min,
+            k_max,
+            (self.query_str.len() as i32 - self.target_str.len() as i32)
+        );
+        if min(k_max.abs(), k_min.abs()) as usize > max(self.query_str.len(), self.target_str.len()) {
+             return None
+        } 
         debug!("score: {}", self.score);
-        debug!("match wf 1: {:?}", self.match_layer.s_k_to_y_map.clone());
         debug!("---");
         Some(self.score)
     }
@@ -567,10 +564,10 @@ impl<'a> WaveFronts<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use simple_logger::SimpleLogger;
 
     #[test]
     fn test_step() {
-        use simple_logger::SimpleLogger;
         SimpleLogger::new().init().unwrap();
         let t_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAATACATGAAAGTTGCATGAAACATACATGAAAAAAGTTGCATGAAACCCCATACATGAAAGTTGCATGAA";
         let q_str = "ACATACATGAAAAAAGTTGCATGAAAAAACATACATGAAAGTTGCATGAAACATACATGAAAAAAGTTGCAAAAGTTGCATGAAACATACATGAAAATGAAAAAACATACATGAAAGTTGCATGAA";
@@ -583,11 +580,12 @@ mod tests {
 
     #[test]
     fn test_step_2() {
-        use simple_logger::SimpleLogger;
         SimpleLogger::new().init().unwrap();
-        let t_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAAAAAATGAAAGTTGCATGAA";
-        let q_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAAATGAAAGTAAAATGAAAGTTGCATGAATGCATACATGAAAGTTGCA";
-        let mut wfs = WaveFronts::new_with_capacity(t_str, q_str, 40, 2, 2, 1, t_str.len() >> 4);
+        let q_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAAAAAATGAAAGTTGCATGAA";
+        let t_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAAATGAAAGTAAAATGAAAGTTGCATGAATGCATACATGAAAGTTGCA";
+        let len_diff = (t_str.len() as i32 - q_str.len() as i32).unsigned_abs();
+        let max_wf_length = len_diff * 2; 
+        let mut wfs = WaveFronts::new_with_capacity(t_str, q_str, max_wf_length, 9, 2, 1, t_str.len() >> 4);
         wfs.step_all();
         let (t_aln_str, q_aln_str) = wfs.backtrace();
         println!("{}", t_aln_str);
