@@ -226,7 +226,7 @@ impl<'a> WaveFronts<'a> {
             if let Some((score, connection_to, connection_from)) = connection {
                 let x = (connection_to.1 as i32 - connection_to.0) as usize;
                 let y = connection_to.1 as usize;
-                if x < self.target_str.len() && y < self.query_str.len() {
+                if x <= self.target_str.len() && y <= self.query_str.len() {
                     self.insertion_layer
                         .s_k_to_y_map
                         .insert((score, k), connection_to.1);
@@ -271,7 +271,7 @@ impl<'a> WaveFronts<'a> {
             if let Some((connection_to, connection_from)) = connection {
                 let x = (connection_to.1 as i32 - connection_to.0) as usize;
                 let y = connection_to.1 as usize;
-                if x < self.target_str.len() && y < self.query_str.len() {
+                if x <= self.target_str.len() && y <= self.query_str.len() {
                     self.deletion_layer
                         .s_k_to_y_map
                         .insert((score, k), connection_to.1);
@@ -343,7 +343,7 @@ impl<'a> WaveFronts<'a> {
                 if self.backtrace_map.get(&connection_to).is_none() {
                     let x = (connection_to.1 as i32 - connection_to.0) as usize;
                     let y = connection_to.1 as usize;
-                    if x < self.target_str.len() && y < self.query_str.len() {
+                    if x <= self.target_str.len() && y <= self.query_str.len() {
                         self.match_layer
                             .s_k_to_y_map
                             .insert((score, k), connection_to.1);
@@ -466,8 +466,6 @@ impl<'a> WaveFronts<'a> {
                         .insert(connection_to, (connection_from, score));
                 }
             });
-        // debug!("backtrack_map: {:?}", self.backtrace_map.clone());
-        // debug!("match wf 0: {:?}", self.match_layer.s_k_to_y_map.clone());
         if let Some(y) = self.match_layer.s_k_to_y_map.get(&(
             self.score,
             self.query_str.len() as i32 - self.target_str.len() as i32,
@@ -568,7 +566,7 @@ mod tests {
 
     #[test]
     fn test_step() {
-        SimpleLogger::new().init().unwrap();
+        SimpleLogger::new().init().unwrap_or_default();
         let t_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAATACATGAAAGTTGCATGAAACATACATGAAAAAAGTTGCATGAAACCCCATACATGAAAGTTGCATGAA";
         let q_str = "ACATACATGAAAAAAGTTGCATGAAAAAACATACATGAAAGTTGCATGAAACATACATGAAAAAAGTTGCAAAAGTTGCATGAAACATACATGAAAATGAAAAAACATACATGAAAGTTGCATGAA";
         let mut wfs = WaveFronts::new_with_capacity(t_str, q_str, 40, 2, 2, 1, t_str.len() >> 4);
@@ -580,9 +578,9 @@ mod tests {
 
     #[test]
     fn test_step_2() {
-        SimpleLogger::new().init().unwrap();
-        let q_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAAAAAATGAAAGTTGCATGAA";
-        let t_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAAATGAAAGTAAAATGAAAGTTGCATGAATGCATACATGAAAGTTGCA";
+        SimpleLogger::new().init().unwrap_or_default();
+        let t_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAAAAAATGAAAGTTGCATGAAAATTTT";
+        let q_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAAATGAAAGTAAAATGAAAGTTGCATGAATGAAATGGTACATACATGAAAGTTGCAGGGG";
         let len_diff = (t_str.len() as i32 - q_str.len() as i32).unsigned_abs();
         let max_wf_length = len_diff * 2; 
         let mut wfs = WaveFronts::new_with_capacity(t_str, q_str, max_wf_length, 9, 2, 1, t_str.len() >> 4);
