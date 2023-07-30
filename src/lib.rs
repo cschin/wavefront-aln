@@ -89,7 +89,7 @@ impl<'a> WaveFronts<'a> {
     pub fn new(
         t_str: &'a str,
         q_str: &'a str,
-        min_wf_length: u32,
+        max_wf_length: u32,
         mismatch_penalty: i32,
         open_penalty: i32,
         extension_penalty: i32,
@@ -105,7 +105,7 @@ impl<'a> WaveFronts<'a> {
             insertion_layer,
             deletion_layer,
             match_layer,
-            max_wf_length: min_wf_length,
+            max_wf_length,
             mismatch_penalty,
             open_penalty,
             extension_penalty,
@@ -117,7 +117,7 @@ impl<'a> WaveFronts<'a> {
     pub fn new_with_capacity(
         t_str: &'a str,
         q_str: &'a str,
-        min_wf_length: u32,
+        max_wf_length: u32,
         mismatch_penalty: i32,
         open_penalty: i32,
         extension_penalty: i32,
@@ -134,7 +134,7 @@ impl<'a> WaveFronts<'a> {
             insertion_layer,
             deletion_layer,
             match_layer,
-            max_wf_length: min_wf_length,
+            max_wf_length,
             mismatch_penalty,
             open_penalty,
             extension_penalty,
@@ -584,6 +584,20 @@ mod tests {
         let len_diff = (t_str.len() as i32 - q_str.len() as i32).unsigned_abs();
         let max_wf_length = len_diff * 2; 
         let mut wfs = WaveFronts::new_with_capacity(t_str, q_str, max_wf_length, 9, 2, 1, t_str.len() >> 4);
+        wfs.step_all();
+        let (t_aln_str, q_aln_str) = wfs.backtrace();
+        println!("{}", t_aln_str);
+        println!("{}", q_aln_str);
+    }
+
+    #[test]
+    fn test_step_3() {
+        SimpleLogger::new().init().unwrap_or_default();
+        let t_str = "GAAAGACCTGAAAGATCACGGTGCCTTCATTTCAACTGTGAGACATGAAGTAATTTTCCCAAATCTACAACATTAAGATATGGTGCAATAAGGACCAGAT";
+        let q_str = "CTCCAACACGAGATTACCCAACCCAGGAGCAAGGAAATCAGTAACTTCCTCCCTATAACTTGGAATGTGGGTGGAGGGGTTCATAGTTCTCCCTGAGTGA";
+        let len_diff = (t_str.len() as i32 - q_str.len() as i32).unsigned_abs();
+        let max_wf_length = len_diff * 2; 
+        let mut wfs = WaveFronts::new_with_capacity(t_str, q_str, max_wf_length, 4  , 2, 1, t_str.len() >> 4);
         wfs.step_all();
         let (t_aln_str, q_aln_str) = wfs.backtrace();
         println!("{}", t_aln_str);
