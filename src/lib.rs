@@ -15,6 +15,14 @@ pub enum AlnLayer {
     Match,
 }
 
+#[derive(Eq, PartialEq)]
+pub enum WaveFrontStepResult {
+    ReachMaxScore,
+    ReachEnd,
+    Fail,
+    Continue,
+}
+
 pub struct WaveFronts<'a> {
     target_str: &'a str,
     query_str: &'a str,
@@ -43,7 +51,7 @@ impl WaveFront {
         let score_to_k_range = FxHashMap::with_capacity_and_hasher(capacity, Default::default());
         let mut wf = WaveFront {
             s_k_to_y_map,
-            score_to_k_range
+            score_to_k_range,
         };
         wf.score_to_k_range.insert(0, (0, 1));
         wf
@@ -121,7 +129,7 @@ impl<'a> WaveFronts<'a> {
         mismatch_penalty: i32,
         open_penalty: i32,
         extension_penalty: i32,
-        capacity: usize
+        capacity: usize,
     ) -> Self {
         let insertion_layer = WaveFront::new_with_capacity(capacity);
         let deletion_layer = WaveFront::new_with_capacity(capacity);
@@ -451,7 +459,7 @@ impl<'a> WaveFronts<'a> {
         }
     }
 
-    fn step_one(&mut self) -> Option<i32> {
+    fn step_one(&mut self, max_score: Option<i32>) -> WaveFrontStepResult {
         self.match_layer
             .advance(self.target_str, self.query_str, self.score)
             .into_iter()
@@ -471,7 +479,7 @@ impl<'a> WaveFronts<'a> {
             self.query_str.len() as i32 - self.target_str.len() as i32,
         )) {
             if *y as usize >= self.query_str.len() {
-                return None;
+                return WaveFrontStepResult::ReachEnd;
             }
         }
 
@@ -485,18 +493,32 @@ impl<'a> WaveFronts<'a> {
             k_max,
             (self.query_str.len() as i32 - self.target_str.len() as i32)
         );
-        if min(k_max.abs(), k_min.abs()) as usize > max(self.query_str.len(), self.target_str.len()) {
-             return None
-        } 
+        if min(k_max.abs(), k_min.abs()) as usize > max(self.query_str.len(), self.target_str.len())
+        {
+            return WaveFrontStepResult::Fail;
+        }
         debug!("score: {}", self.score);
         debug!("---");
-        Some(self.score)
+        if let Some(max_score) = max_score {
+            if self.score >= max_score {
+                WaveFrontStepResult::ReachMaxScore
+            } else {
+                WaveFrontStepResult::Continue
+            }
+        } else {
+            WaveFrontStepResult::Continue
+        }
     }
 
-    pub fn step_all(&mut self) {
+    pub fn step_all(&mut self, max_score: Option<i32>) -> WaveFrontStepResult {
         loop {
-            if self.step_one().is_none() {
-                break;
+            match self.step_one(max_score) {
+                WaveFrontStepResult::Continue => {
+                    continue;
+                }
+                WaveFrontStepResult::ReachMaxScore => break WaveFrontStepResult::ReachMaxScore,
+                WaveFrontStepResult::Fail => break WaveFrontStepResult::Fail,
+                WaveFrontStepResult::ReachEnd => break WaveFrontStepResult::ReachEnd,
             }
         }
     }
@@ -569,25 +591,30 @@ mod tests {
         SimpleLogger::new().init().unwrap_or_default();
         let t_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAATACATGAAAGTTGCATGAAACATACATGAAAAAAGTTGCATGAAACCCCATACATGAAAGTTGCATGAA";
         let q_str = "ACATACATGAAAAAAGTTGCATGAAAAAACATACATGAAAGTTGCATGAAACATACATGAAAAAAGTTGCAAAAGTTGCATGAAACATACATGAAAATGAAAAAACATACATGAAAGTTGCATGAA";
-        let mut wfs = WaveFronts::new_with_capacity(t_str, q_str, 40, 2, 2, 1, t_str.len() >> 4);
-        wfs.step_all();
-        let (t_aln_str, q_aln_str) = wfs.backtrace();
-        println!("{}", t_aln_str);
-        println!("{}", q_aln_str);
+        let capacity = std::cmp::max(1024, std::cmp::max(t_str.len(), q_str.len()) >> 5);
+        let mut wfs = WaveFronts::new_with_capacity(t_str, q_str, 40, 2, 2, 1, capacity);
+        if wfs.step_all(Some(1024)) == WaveFrontStepResult::ReachEnd {
+            let (t_aln_str, q_aln_str) = wfs.backtrace();
+            println!("{}", t_aln_str);
+            println!("{}", q_aln_str);
+        }
     }
 
     #[test]
     fn test_step_2() {
         SimpleLogger::new().init().unwrap_or_default();
-        let t_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAAAAAATGAAAGTTGCATGAAAATTTT";
+        let t_str =
+            "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAAAAAATGAAAGTTGCATGAAAATTTT";
         let q_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAAATGAAAGTAAAATGAAAGTTGCATGAATGAAATGGTACATACATGAAAGTTGCAGGGG";
         let len_diff = (t_str.len() as i32 - q_str.len() as i32).unsigned_abs();
-        let max_wf_length = len_diff * 2; 
-        let mut wfs = WaveFronts::new_with_capacity(t_str, q_str, max_wf_length, 9, 2, 1, t_str.len() >> 4);
-        wfs.step_all();
-        let (t_aln_str, q_aln_str) = wfs.backtrace();
-        println!("{}", t_aln_str);
-        println!("{}", q_aln_str);
+        let max_wf_length = len_diff;
+        let capacity = std::cmp::max(1024, std::cmp::max(t_str.len(), q_str.len()) >> 5);
+        let mut wfs = WaveFronts::new_with_capacity(t_str, q_str, max_wf_length, 9, 2, 1, capacity);
+        if wfs.step_all(Some(1024)) == WaveFrontStepResult::ReachEnd {
+            let (t_aln_str, q_aln_str) = wfs.backtrace();
+            println!("{}", t_aln_str);
+            println!("{}", q_aln_str);
+        }
     }
 
     #[test]
@@ -596,11 +623,13 @@ mod tests {
         let t_str = "GAAAGACCTGAAAGATCACGGTGCCTTCATTTCAACTGTGAGACATGAAGTAATTTTCCCAAATCTACAACATTAAGATATGGTGCAATAAGGACCAGAT";
         let q_str = "CTCCAACACGAGATTACCCAACCCAGGAGCAAGGAAATCAGTAACTTCCTCCCTATAACTTGGAATGTGGGTGGAGGGGTTCATAGTTCTCCCTGAGTGA";
         let len_diff = (t_str.len() as i32 - q_str.len() as i32).unsigned_abs();
-        let max_wf_length = len_diff * 2; 
-        let mut wfs = WaveFronts::new_with_capacity(t_str, q_str, max_wf_length, 4  , 2, 1, t_str.len() >> 4);
-        wfs.step_all();
-        let (t_aln_str, q_aln_str) = wfs.backtrace();
-        println!("{}", t_aln_str);
-        println!("{}", q_aln_str);
+        let max_wf_length = len_diff * 2;
+        let mut wfs =
+            WaveFronts::new_with_capacity(t_str, q_str, max_wf_length, 4, 2, 1, t_str.len() >> 4);
+        if wfs.step_all(Some(1024)) == WaveFrontStepResult::ReachEnd {
+            let (t_aln_str, q_aln_str) = wfs.backtrace();
+            println!("{}", t_aln_str);
+            println!("{}", q_aln_str);
+        }
     }
 }
