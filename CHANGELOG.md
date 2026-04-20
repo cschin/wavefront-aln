@@ -1,12 +1,26 @@
 # Changelog
 
+## 0.2.1
+
+### Performance
+
+- **`advance()` is now callback-based.** The old signature returned `Vec<(Connection, i32)>` that `step_one()` consumed immediately. The new signature takes `impl FnMut(Connection, i32)` and streams each edge into the caller's sink, eliminating the per-step heap allocation.
+- **`backtrace_map` densified.** The `FxHashMap<(i32, u32, AlnLayer), ...>` is replaced by three dense `Vec<Vec<PredEntry>>` (one per layer, outer `[y]`, inner `[k + k_offset]`, with `layer == PRED_NONE` marking absent). Each cell is 16 bytes, so memory is proportional to `q_len × k_width × 3`; hash lookups become direct Vec indexing on the hot path. Every backtrace hit inside `next()` and `step_one()` is now a pointer dereference.
+- **`reduce()` scratch buffer reused.** `kdist` is now a `Vec<u32>` field on `WaveFronts` (size `k_width`, sentinel `u32::MAX`). `reduce()` writes into it, reads for the `new_kmin`/`new_kmax` search, then resets only the slots it touched — no per-call allocation.
+- **Preallocate `s_k_to_y` and `score_to_k_range` rows upfront.** `WaveFront::new_with_capacity` now eagerly fills `capacity` rows instead of lazily pushing one per score. Removes per-step malloc jitter when the caller provides a meaningful capacity hint.
+- **Dependencies pruned.** `rustc-hash` and `simple_logger` removed from `Cargo.toml` — both were only used by the HashMap-era code and the old fixture-only tests.
+
+### Breaking change
+
+- `WaveFronts::backtrace_map` (public field) is removed. The new dense store is private and accessed through `backtrace()`. If downstream code read the field directly, call `backtrace()` instead.
+
 ## 0.2.0
 
 ### Performance
 
 - **Flat-`Vec` storage for the two hot data structures.** `s_k_to_y` is now a `Vec<Vec<u32>>` (outer indexed by `score`, inner a fixed-width window of size `t_len + q_len + 3` indexed by `k + k_offset`, with sentinel `u32::MAX` for absent). `score_to_k_range` is a `Vec<Option<(i32, i32)>>` indexed by `score`. Both replace `FxHashMap`, removing hash overhead from the inner loop of `next()`, `advance()`, and `reduce()` — the hottest paths in the algorithm. Out-of-window reads (e.g. `k±1` at the boundary) return `None` as before; writes are guaranteed in-window by the existing `x ≤ t_len && y ≤ q_len` guard.
 - **`advance()` takes `&[u8]` directly.** `step_one()` passes `target_str.as_bytes()` / `query_str.as_bytes()` once per step instead of shadowing inside the inner loop.
-- **Dead code removed during the rewrite.** The `if e.1 > score` branch in the insert/delete blocks (unreachable given monotonic `score`) and the asymmetric `is_none()` guard on the match block collapsed into single `entry(...).or_insert(...)` / `contains_key(...)` calls.
+- **Dead code removed.** The `if e.1 > score` branch in the insert/delete blocks (unreachable given monotonic `score`) and the asymmetric `is_none()` guard on the match block collapsed into single `entry(...).or_insert(...)` / `contains_key(...)` calls.
 
 ### Bug fixes
 

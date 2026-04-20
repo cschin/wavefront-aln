@@ -1,11 +1,54 @@
 use log::debug;
-use rustc_hash::FxHashMap;
 
 use std::cmp::{max, min};
 
-/// Sentinel value used in the flat `s_k_to_y` Vec to mean "no entry". Chosen
-/// so it can never collide with a real `y` (which is bounded by `q_len`).
+/// Sentinel value used in the flat `s_k_to_y` / `kdist` Vecs to mean "no
+/// entry". Chosen so it can never collide with a real `y` (bounded by `q_len`)
+/// or a real distance (bounded by `max(t_len, q_len)`).
 const SENTINEL: u32 = u32::MAX;
+
+// Dense-backtrace layer codes. Stored in `PredEntry::layer`; `PRED_NONE` marks
+// an empty slot so we can skip `Option` padding in the inner cell.
+const LAYER_MATCH: u8 = 0;
+const LAYER_INSERT: u8 = 1;
+const LAYER_DELETE: u8 = 2;
+const PRED_NONE: u8 = 255;
+
+#[inline]
+fn layer_code(l: AlnLayer) -> u8 {
+    match l {
+        AlnLayer::Match => LAYER_MATCH,
+        AlnLayer::Insert => LAYER_INSERT,
+        AlnLayer::Delete => LAYER_DELETE,
+    }
+}
+
+#[inline]
+fn code_to_layer(c: u8) -> AlnLayer {
+    match c {
+        LAYER_MATCH => AlnLayer::Match,
+        LAYER_INSERT => AlnLayer::Insert,
+        LAYER_DELETE => AlnLayer::Delete,
+        _ => unreachable!("invalid layer code {}", c),
+    }
+}
+
+/// One cell in the dense backtrace store: predecessor anchor plus the score at
+/// which the predecessor was first reached.
+#[derive(Clone, Copy)]
+struct PredEntry {
+    k: i32,
+    y: u32,
+    layer: u8,
+    score: i32,
+}
+
+const SENTINEL_PRED: PredEntry = PredEntry {
+    k: 0,
+    y: 0,
+    layer: PRED_NONE,
+    score: 0,
+};
 
 fn gap_affine_score(t_aln: &str, q_aln: &str, mismatch: i32, open: i32, ext: i32) -> i32 {
     let tb = t_aln.as_bytes();
@@ -72,7 +115,14 @@ pub struct WaveFronts<'a> {
     pub open_penalty: i32,
     pub extension_penalty: i32,
     pub score: i32,
-    pub backtrace_map: FxHashMap<(i32, u32, AlnLayer), ((i32, u32, AlnLayer), i32)>,
+    /// Dense per-layer backtrace store indexed by `[layer_code][y][k + k_offset]`.
+    /// Each cell is a `PredEntry` with `layer == PRED_NONE` marking "absent".
+    /// Replaces the previous `FxHashMap<(i32, u32, AlnLayer), ...>`.
+    bt: [Vec<Vec<PredEntry>>; 3],
+    /// Reusable scratch buffer for `reduce()`; indexed by `k + k_offset`, with
+    /// `SENTINEL` marking "no entry". Cleared in-place after each `reduce()`
+    /// call so we don't allocate a fresh FxHashMap on every invocation.
+    kdist: Vec<u32>,
 }
 type Anchor = (i32, u32, AlnLayer);
 type Connection = (Anchor, Anchor); // Connection.0 is the best score at the end point
@@ -85,9 +135,18 @@ impl WaveFront {
         // extra conditionals in the hot loop.
         let k_offset = t_len as i32 + 1;
         let k_width = t_len + q_len + 3;
+        let mut s_k_to_y: Vec<Vec<u32>> = Vec::with_capacity(capacity);
+        let mut score_to_k_range: Vec<Option<(i32, i32)>> = Vec::with_capacity(capacity);
+        // Preallocate all rows the caller hinted at so the hot loop doesn't
+        // stop to malloc. Rows past what the algorithm actually reaches are
+        // harmless — they just stay at SENTINEL.
+        for _ in 0..capacity {
+            s_k_to_y.push(vec![SENTINEL; k_width]);
+            score_to_k_range.push(None);
+        }
         let mut wf = WaveFront {
-            s_k_to_y: Vec::with_capacity(capacity),
-            score_to_k_range: Vec::with_capacity(capacity),
+            s_k_to_y,
+            score_to_k_range,
             k_width,
             k_offset,
         };
@@ -156,36 +215,34 @@ impl WaveFront {
         self.score_to_k_range[score as usize] = Some(range);
     }
 
-    fn advance(&mut self, t: &[u8], q: &[u8], score: i32) -> Vec<(Connection, i32)> {
+    /// Extend matches along every active diagonal at `score`, streaming each
+    /// `(to_anchor, from_anchor)` pair into `sink` as we go. The callback-based
+    /// API avoids the intermediate `Vec<(Connection, i32)>` allocation that
+    /// the old signature produced on every call.
+    fn advance<F>(&mut self, t: &[u8], q: &[u8], score: i32, mut sink: F)
+    where
+        F: FnMut(Connection, i32),
+    {
         debug!("advance score: {}", score);
         let (k_min, k_max) = self.get_range(score).expect("no range");
-        (k_min..k_max)
-            .filter_map(|k| {
-                if let Some(y) = self.get_y(score, k) {
-                    let mut xs = (y as i32 - k) as usize; // k = y - x
-                    let mut ys = y as usize;
-                    loop {
-                        if xs >= t.len() || ys >= q.len() || t[xs] != q[ys] {
-                            break;
-                        }
-                        xs += 1;
-                        ys += 1;
-                    }
-                    debug!("advance: k:{} y: {} -> {}", k, y, ys);
-                    if ys > y as usize {
-                        self.set_y(score, k, ys as u32);
-                        Some((
-                            ((k, ys as u32, AlnLayer::Match), (k, y, AlnLayer::Match)),
-                            score,
-                        ))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+        for k in k_min..k_max {
+            if let Some(y) = self.get_y(score, k) {
+                let mut xs = (y as i32 - k) as usize; // k = y - x
+                let mut ys = y as usize;
+                while xs < t.len() && ys < q.len() && t[xs] == q[ys] {
+                    xs += 1;
+                    ys += 1;
                 }
-            })
-            .collect()
+                debug!("advance: k:{} y: {} -> {}", k, y, ys);
+                if ys > y as usize {
+                    self.set_y(score, k, ys as u32);
+                    sink(
+                        ((k, ys as u32, AlnLayer::Match), (k, y, AlnLayer::Match)),
+                        score,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -225,6 +282,16 @@ impl<'a> WaveFronts<'a> {
         let mut match_layer = WaveFront::new_with_capacity(t_len, q_len, capacity);
         match_layer.set_y(0, 0, 0);
 
+        let k_width = match_layer.k_width;
+        // `bt` rows grow lazily as new `y` values are reached; preallocate the
+        // row capacity only. Each cell is 16 bytes so the upfront cost stays
+        // proportional to the input and not to max_score.
+        let bt: [Vec<Vec<PredEntry>>; 3] = [
+            Vec::with_capacity(q_len + 1),
+            Vec::with_capacity(q_len + 1),
+            Vec::with_capacity(q_len + 1),
+        ];
+
         WaveFronts {
             target_str: t_str,
             query_str: q_str,
@@ -236,9 +303,54 @@ impl<'a> WaveFronts<'a> {
             open_penalty,
             extension_penalty,
             score: 0,
-            backtrace_map: FxHashMap::default(),
+            bt,
+            kdist: vec![SENTINEL; k_width],
         }
     }
+
+    // --- Dense backtrace store accessors --------------------------------------
+
+    #[inline]
+    fn bt_get(&self, k: i32, y: u32, layer: AlnLayer) -> Option<PredEntry> {
+        let k_idx = self.match_layer.k_idx(k)?;
+        let rows = &self.bt[layer_code(layer) as usize];
+        let row = rows.get(y as usize)?;
+        let cell = row[k_idx];
+        if cell.layer == PRED_NONE {
+            None
+        } else {
+            Some(cell)
+        }
+    }
+
+    #[inline]
+    fn bt_contains(&self, k: i32, y: u32, layer: AlnLayer) -> bool {
+        self.bt_get(k, y, layer).is_some()
+    }
+
+    /// First-write-wins insert used by `next()`. If the cell already holds a
+    /// value we keep it — matches the `HashMap::entry().or_insert(...)` rule.
+    fn bt_insert_if_absent(&mut self, to: &Anchor, from: &Anchor, score: i32) {
+        let Some(k_idx) = self.match_layer.k_idx(to.0) else {
+            return;
+        };
+        let k_width = self.match_layer.k_width;
+        let rows = &mut self.bt[layer_code(to.2.clone()) as usize];
+        let y = to.1 as usize;
+        while rows.len() <= y {
+            rows.push(vec![SENTINEL_PRED; k_width]);
+        }
+        let cell = &mut rows[y][k_idx];
+        if cell.layer == PRED_NONE {
+            *cell = PredEntry {
+                k: from.0,
+                y: from.1,
+                layer: layer_code(from.2.clone()),
+                score,
+            };
+        }
+    }
+
 
     pub fn next(&mut self, score: i32) {
         let (match_k_min, match_k_max) = self
@@ -312,9 +424,7 @@ impl<'a> WaveFronts<'a> {
                 let y = connection_to.1 as usize;
                 if x <= t_len && y <= q_len {
                     self.insertion_layer.set_y(score, k, connection_to.1);
-                    self.backtrace_map
-                        .entry(connection_to)
-                        .or_insert((connection_from, score));
+                    self.bt_insert_if_absent(&connection_to, &connection_from, score);
                 }
             }
 
@@ -347,9 +457,7 @@ impl<'a> WaveFronts<'a> {
                 let y = connection_to.1 as usize;
                 if x <= t_len && y <= q_len {
                     self.deletion_layer.set_y(score, k, connection_to.1);
-                    self.backtrace_map
-                        .entry(connection_to)
-                        .or_insert((connection_from, score));
+                    self.bt_insert_if_absent(&connection_to, &connection_from, score);
                 }
             }
 
@@ -401,13 +509,12 @@ impl<'a> WaveFronts<'a> {
             };
 
             if let Some((connection_to, connection_from)) = connection {
-                if !self.backtrace_map.contains_key(&connection_to) {
+                if !self.bt_contains(connection_to.0, connection_to.1, connection_to.2.clone()) {
                     let x = (connection_to.1 as i32 - connection_to.0) as usize;
                     let y = connection_to.1 as usize;
                     if x <= t_len && y <= q_len {
                         self.match_layer.set_y(score, k, connection_to.1);
-                        self.backtrace_map
-                            .insert(connection_to, (connection_from, score));
+                        self.bt_insert_if_absent(&connection_to, &connection_from, score);
                     }
                 }
             }
@@ -421,105 +528,154 @@ impl<'a> WaveFronts<'a> {
             .expect("match-layer range missing at self.score");
         let k_end = self.query_str.len() as i32 - self.target_str.len() as i32;
         debug!("reduce, kmin-kmax: ({}):({}), {}", kmin, kmax, kmax - kmin);
-        if (kmax - kmin) as u32 > self.max_wf_length {
-            let mut dmin = usize::MAX;
-            let mut kdist = FxHashMap::<i32, usize>::default();
-
-            let t_len = self.target_str.len();
-            let q_len = self.query_str.len();
-
-            (kmin..kmax).for_each(|k| {
-                let Some(y) = self.match_layer.get_y(self.score, k) else {
-                    return;
-                };
-                let y = y as usize;
-                if y > q_len {
-                    return;
-                }
-                let dy = q_len - y;
-                let x = (y as i32 - k) as usize;
-                if x > t_len {
-                    return;
-                }
-                let dx = t_len - x;
-                let max_d = max(dx, dy);
-                kdist.insert(k, max_d);
-                dmin = min(dmin, max_d);
-            });
-
-            if kdist.is_empty() {
-                return;
-            }
-
-            let mut new_kmin = kmin;
-            while new_kmin < kmax - 1 {
-                if !kdist.contains_key(&new_kmin) {
-                    new_kmin += 1;
-                    continue;
-                }
-                if *kdist.get(&new_kmin).unwrap() - dmin <= self.max_wf_length as usize {
-                    break;
-                }
-                new_kmin += 1;
-            }
-
-            let mut new_kmax = kmax;
-            while new_kmax > new_kmin + 1 {
-                if !kdist.contains_key(&new_kmax) {
-                    new_kmax -= 1;
-                    continue;
-                }
-                if *kdist.get(&new_kmax).unwrap() - dmin <= self.max_wf_length as usize {
-                    new_kmax += 1;
-                    break;
-                }
-                new_kmax -= 1;
-            }
-
-            // Never prune the target diagonal — the optimal path must end
-            // there. Without this, reduce() can drift the range far from k_end
-            // and leave the algorithm unable to close out the alignment.
-            let new_kmin = min(new_kmin, k_end);
-            let new_kmax = max(new_kmax, k_end + 1);
-
-            debug!(
-                "score: {}, kmin:{}, kmax:{}, new_kmin:{}, new_kmax:{}",
-                self.score, kmin, kmax, new_kmin, new_kmax
-            );
-
-            self.match_layer.set_range(self.score, (new_kmin, new_kmax));
-
-            let (i_kmin, i_kmax) = self.insertion_layer.get_range(self.score).unwrap();
-            self.insertion_layer.set_range(
-                self.score,
-                (max(new_kmin, i_kmin), min(new_kmax, i_kmax)),
-            );
-
-            let (d_kmin, d_kmax) = self.deletion_layer.get_range(self.score).unwrap();
-            self.deletion_layer.set_range(
-                self.score,
-                (max(new_kmin, d_kmin), min(new_kmax, d_kmax)),
-            );
+        if (kmax - kmin) as u32 <= self.max_wf_length {
+            return;
         }
+
+        let t_len = self.target_str.len();
+        let q_len = self.query_str.len();
+        let k_offset = self.match_layer.k_offset;
+        let k_width = self.match_layer.k_width;
+        let score = self.score;
+        // Convert a k to an in-bounds index into `kdist`, or None if k falls
+        // outside the pre-sized window. `k_offset`/`k_width` were chosen so
+        // every valid wavefront position fits, but the wavefront range can
+        // temporarily include a 1-slot margin on either side.
+        let kdist_idx = |k: i32| -> Option<usize> {
+            let idx = k + k_offset;
+            if idx < 0 || (idx as usize) >= k_width {
+                None
+            } else {
+                Some(idx as usize)
+            }
+        };
+
+        let mut dmin = usize::MAX;
+        let mut any_entry = false;
+
+        for k in kmin..kmax {
+            let Some(y) = self.match_layer.get_y(score, k) else {
+                continue;
+            };
+            let y = y as usize;
+            if y > q_len {
+                continue;
+            }
+            let dy = q_len - y;
+            let x = (y as i32 - k) as usize;
+            if x > t_len {
+                continue;
+            }
+            let dx = t_len - x;
+            let max_d = max(dx, dy);
+            if let Some(k_idx) = kdist_idx(k) {
+                self.kdist[k_idx] = max_d as u32;
+                any_entry = true;
+            }
+            dmin = min(dmin, max_d);
+        }
+
+        if !any_entry {
+            return;
+        }
+
+        let max_wf = self.max_wf_length as usize;
+
+        let mut new_kmin = kmin;
+        while new_kmin < kmax - 1 {
+            let d = kdist_idx(new_kmin).map(|i| self.kdist[i]).unwrap_or(SENTINEL);
+            if d == SENTINEL {
+                new_kmin += 1;
+                continue;
+            }
+            if (d as usize) - dmin <= max_wf {
+                break;
+            }
+            new_kmin += 1;
+        }
+
+        let mut new_kmax = kmax;
+        while new_kmax > new_kmin + 1 {
+            let d = kdist_idx(new_kmax).map(|i| self.kdist[i]).unwrap_or(SENTINEL);
+            if d == SENTINEL {
+                new_kmax -= 1;
+                continue;
+            }
+            if (d as usize) - dmin <= max_wf {
+                new_kmax += 1;
+                break;
+            }
+            new_kmax -= 1;
+        }
+
+        // Reset the scratch slots we wrote so the next reduce() sees SENTINEL
+        // everywhere. We only touch (kmin..kmax), not the whole k_width.
+        for k in kmin..kmax {
+            if let Some(k_idx) = kdist_idx(k) {
+                self.kdist[k_idx] = SENTINEL;
+            }
+        }
+
+        // Never prune the target diagonal — the optimal path must end there.
+        // Without this, reduce() can drift the range far from k_end and leave
+        // the algorithm unable to close out the alignment.
+        let new_kmin = min(new_kmin, k_end);
+        let new_kmax = max(new_kmax, k_end + 1);
+
+        debug!(
+            "score: {}, kmin:{}, kmax:{}, new_kmin:{}, new_kmax:{}",
+            score, kmin, kmax, new_kmin, new_kmax
+        );
+
+        self.match_layer.set_range(score, (new_kmin, new_kmax));
+
+        let (i_kmin, i_kmax) = self.insertion_layer.get_range(score).unwrap();
+        self.insertion_layer.set_range(
+            score,
+            (max(new_kmin, i_kmin), min(new_kmax, i_kmax)),
+        );
+
+        let (d_kmin, d_kmax) = self.deletion_layer.get_range(score).unwrap();
+        self.deletion_layer.set_range(
+            score,
+            (max(new_kmin, d_kmin), min(new_kmax, d_kmax)),
+        );
     }
 
     fn step_one(&mut self, max_score: Option<i32>) -> WaveFrontStepResult {
         let t_bytes = self.target_str.as_bytes();
         let q_bytes = self.query_str.as_bytes();
-        let advances = self.match_layer.advance(t_bytes, q_bytes, self.score);
-        advances
-            .into_iter()
-            .for_each(|((connection_to, connection_from), score)| {
-                if let Some(e) = self.backtrace_map.get(&connection_to) {
-                    if score < e.1 {
-                        self.backtrace_map
-                            .insert(connection_to, (connection_from, score));
-                    }
-                } else {
-                    self.backtrace_map
-                        .insert(connection_to, (connection_from, score));
-                }
-            });
+        let score = self.score;
+
+        // Split-borrow: advance() needs &mut match_layer, the sink needs
+        // &mut bt[LAYER_MATCH] (disjoint fields), and we cache the layer's
+        // indexing constants by value to avoid re-borrowing them in the loop.
+        let match_layer = &mut self.match_layer;
+        let bt_match = &mut self.bt[LAYER_MATCH as usize];
+        let k_offset = match_layer.k_offset;
+        let k_width = match_layer.k_width;
+
+        match_layer.advance(t_bytes, q_bytes, score, |(to, from), edge_score| {
+            let idx = to.0 + k_offset;
+            if idx < 0 || (idx as usize) >= k_width {
+                return;
+            }
+            let k_idx = idx as usize;
+            let y = to.1 as usize;
+            while bt_match.len() <= y {
+                bt_match.push(vec![SENTINEL_PRED; k_width]);
+            }
+            let cell = &mut bt_match[y][k_idx];
+            if cell.layer == PRED_NONE || edge_score < cell.score {
+                *cell = PredEntry {
+                    k: from.0,
+                    y: from.1,
+                    layer: layer_code(from.2),
+                    score: edge_score,
+                };
+            }
+        });
+
         let k_end = self.query_str.len() as i32 - self.target_str.len() as i32;
         if let Some(y) = self.match_layer.get_y(self.score, k_end) {
             if y as usize >= self.query_str.len() {
@@ -582,9 +738,10 @@ impl<'a> WaveFronts<'a> {
             self.query_str.len()
         );
         anchors.push(connect_to.clone());
-        while let Some(connect_from) = self.backtrace_map.get(&connect_to) {
-            assert!(connect_from.0 != connect_to);
-            connect_to = connect_from.clone().0;
+        while let Some(pred) = self.bt_get(connect_to.0, connect_to.1, connect_to.2.clone()) {
+            let pred_anchor = (pred.k, pred.y, code_to_layer(pred.layer));
+            assert!(pred_anchor != connect_to);
+            connect_to = pred_anchor;
             anchors.push(connect_to.clone());
         }
         anchors.reverse();
