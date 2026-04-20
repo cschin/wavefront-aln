@@ -1,4 +1,5 @@
 use log::debug;
+use rustc_hash::FxHashMap;
 
 use std::cmp::{max, min};
 
@@ -6,49 +7,6 @@ use std::cmp::{max, min};
 /// entry". Chosen so it can never collide with a real `y` (bounded by `q_len`)
 /// or a real distance (bounded by `max(t_len, q_len)`).
 const SENTINEL: u32 = u32::MAX;
-
-// Dense-backtrace layer codes. Stored in `PredEntry::layer`; `PRED_NONE` marks
-// an empty slot so we can skip `Option` padding in the inner cell.
-const LAYER_MATCH: u8 = 0;
-const LAYER_INSERT: u8 = 1;
-const LAYER_DELETE: u8 = 2;
-const PRED_NONE: u8 = 255;
-
-#[inline]
-fn layer_code(l: AlnLayer) -> u8 {
-    match l {
-        AlnLayer::Match => LAYER_MATCH,
-        AlnLayer::Insert => LAYER_INSERT,
-        AlnLayer::Delete => LAYER_DELETE,
-    }
-}
-
-#[inline]
-fn code_to_layer(c: u8) -> AlnLayer {
-    match c {
-        LAYER_MATCH => AlnLayer::Match,
-        LAYER_INSERT => AlnLayer::Insert,
-        LAYER_DELETE => AlnLayer::Delete,
-        _ => unreachable!("invalid layer code {}", c),
-    }
-}
-
-/// One cell in the dense backtrace store: predecessor anchor plus the score at
-/// which the predecessor was first reached.
-#[derive(Clone, Copy)]
-struct PredEntry {
-    k: i32,
-    y: u32,
-    layer: u8,
-    score: i32,
-}
-
-const SENTINEL_PRED: PredEntry = PredEntry {
-    k: 0,
-    y: 0,
-    layer: PRED_NONE,
-    score: 0,
-};
 
 fn gap_affine_score(t_aln: &str, q_aln: &str, mismatch: i32, open: i32, ext: i32) -> i32 {
     let tb = t_aln.as_bytes();
@@ -115,10 +73,12 @@ pub struct WaveFronts<'a> {
     pub open_penalty: i32,
     pub extension_penalty: i32,
     pub score: i32,
-    /// Dense per-layer backtrace store indexed by `[layer_code][y][k + k_offset]`.
-    /// Each cell is a `PredEntry` with `layer == PRED_NONE` marking "absent".
-    /// Replaces the previous `FxHashMap<(i32, u32, AlnLayer), ...>`.
-    bt: [Vec<Vec<PredEntry>>; 3],
+    /// Sparse backtrace store keyed by the destination anchor. Value holds the
+    /// predecessor anchor and the edge score at which it was reached. Only
+    /// cells actually visited by the (possibly pruned) wavefront are
+    /// materialised, so memory scales with explored cells — not with
+    /// `t_len × q_len` as a dense store would.
+    backtrace_map: FxHashMap<Anchor, (Anchor, i32)>,
     /// Reusable scratch buffer for `reduce()`; indexed by `k + k_offset`, with
     /// `SENTINEL` marking "no entry". Cleared in-place after each `reduce()`
     /// call so we don't allocate a fresh FxHashMap on every invocation.
@@ -135,15 +95,12 @@ impl WaveFront {
         // extra conditionals in the hot loop.
         let k_offset = t_len as i32 + 1;
         let k_width = t_len + q_len + 3;
-        let mut s_k_to_y: Vec<Vec<u32>> = Vec::with_capacity(capacity);
-        let mut score_to_k_range: Vec<Option<(i32, i32)>> = Vec::with_capacity(capacity);
-        // Preallocate all rows the caller hinted at so the hot loop doesn't
-        // stop to malloc. Rows past what the algorithm actually reaches are
-        // harmless — they just stay at SENTINEL.
-        for _ in 0..capacity {
-            s_k_to_y.push(vec![SENTINEL; k_width]);
-            score_to_k_range.push(None);
-        }
+        // Reserve spine capacity only; rows are allocated lazily by
+        // `ensure_score` as scores are actually reached. Upfront row alloc
+        // would cost `capacity × k_width × 4 B` per layer × 3 layers, which
+        // is tens of MB per alignment even for modest N.
+        let s_k_to_y: Vec<Vec<u32>> = Vec::with_capacity(capacity);
+        let score_to_k_range: Vec<Option<(i32, i32)>> = Vec::with_capacity(capacity);
         let mut wf = WaveFront {
             s_k_to_y,
             score_to_k_range,
@@ -283,14 +240,6 @@ impl<'a> WaveFronts<'a> {
         match_layer.set_y(0, 0, 0);
 
         let k_width = match_layer.k_width;
-        // `bt` rows grow lazily as new `y` values are reached; preallocate the
-        // row capacity only. Each cell is 16 bytes so the upfront cost stays
-        // proportional to the input and not to max_score.
-        let bt: [Vec<Vec<PredEntry>>; 3] = [
-            Vec::with_capacity(q_len + 1),
-            Vec::with_capacity(q_len + 1),
-            Vec::with_capacity(q_len + 1),
-        ];
 
         WaveFronts {
             target_str: t_str,
@@ -303,52 +252,30 @@ impl<'a> WaveFronts<'a> {
             open_penalty,
             extension_penalty,
             score: 0,
-            bt,
+            backtrace_map: FxHashMap::default(),
             kdist: vec![SENTINEL; k_width],
         }
     }
 
-    // --- Dense backtrace store accessors --------------------------------------
+    // --- Sparse backtrace accessors -------------------------------------------
 
     #[inline]
-    fn bt_get(&self, k: i32, y: u32, layer: AlnLayer) -> Option<PredEntry> {
-        let k_idx = self.match_layer.k_idx(k)?;
-        let rows = &self.bt[layer_code(layer) as usize];
-        let row = rows.get(y as usize)?;
-        let cell = row[k_idx];
-        if cell.layer == PRED_NONE {
-            None
-        } else {
-            Some(cell)
-        }
+    fn bt_get(&self, k: i32, y: u32, layer: AlnLayer) -> Option<(Anchor, i32)> {
+        self.backtrace_map.get(&(k, y, layer)).cloned()
     }
 
     #[inline]
     fn bt_contains(&self, k: i32, y: u32, layer: AlnLayer) -> bool {
-        self.bt_get(k, y, layer).is_some()
+        self.backtrace_map.contains_key(&(k, y, layer))
     }
 
-    /// First-write-wins insert used by `next()`. If the cell already holds a
-    /// value we keep it — matches the `HashMap::entry().or_insert(...)` rule.
+    /// First-write-wins insert used by `next()`. Matches `Entry::or_insert`:
+    /// if the destination anchor already has a predecessor we keep the first
+    /// one, preserving the optimal-score ordering the algorithm relies on.
     fn bt_insert_if_absent(&mut self, to: &Anchor, from: &Anchor, score: i32) {
-        let Some(k_idx) = self.match_layer.k_idx(to.0) else {
-            return;
-        };
-        let k_width = self.match_layer.k_width;
-        let rows = &mut self.bt[layer_code(to.2.clone()) as usize];
-        let y = to.1 as usize;
-        while rows.len() <= y {
-            rows.push(vec![SENTINEL_PRED; k_width]);
-        }
-        let cell = &mut rows[y][k_idx];
-        if cell.layer == PRED_NONE {
-            *cell = PredEntry {
-                k: from.0,
-                y: from.1,
-                layer: layer_code(from.2.clone()),
-                score,
-            };
-        }
+        self.backtrace_map
+            .entry(to.clone())
+            .or_insert_with(|| (from.clone(), score));
     }
 
 
@@ -648,31 +575,17 @@ impl<'a> WaveFronts<'a> {
         let score = self.score;
 
         // Split-borrow: advance() needs &mut match_layer, the sink needs
-        // &mut bt[LAYER_MATCH] (disjoint fields), and we cache the layer's
-        // indexing constants by value to avoid re-borrowing them in the loop.
+        // &mut backtrace_map (disjoint fields).
         let match_layer = &mut self.match_layer;
-        let bt_match = &mut self.bt[LAYER_MATCH as usize];
-        let k_offset = match_layer.k_offset;
-        let k_width = match_layer.k_width;
+        let backtrace_map = &mut self.backtrace_map;
 
         match_layer.advance(t_bytes, q_bytes, score, |(to, from), edge_score| {
-            let idx = to.0 + k_offset;
-            if idx < 0 || (idx as usize) >= k_width {
-                return;
-            }
-            let k_idx = idx as usize;
-            let y = to.1 as usize;
-            while bt_match.len() <= y {
-                bt_match.push(vec![SENTINEL_PRED; k_width]);
-            }
-            let cell = &mut bt_match[y][k_idx];
-            if cell.layer == PRED_NONE || edge_score < cell.score {
-                *cell = PredEntry {
-                    k: from.0,
-                    y: from.1,
-                    layer: layer_code(from.2),
-                    score: edge_score,
-                };
+            // Update-if-better: step_one's match extension should keep the
+            // edge with the lowest score (matches the pre-0.2.1 semantics
+            // that picked the earliest score at which a cell was reached).
+            let entry = backtrace_map.entry(to).or_insert((from.clone(), edge_score));
+            if edge_score < entry.1 {
+                *entry = (from, edge_score);
             }
         });
 
@@ -738,8 +651,9 @@ impl<'a> WaveFronts<'a> {
             self.query_str.len()
         );
         anchors.push(connect_to.clone());
-        while let Some(pred) = self.bt_get(connect_to.0, connect_to.1, connect_to.2.clone()) {
-            let pred_anchor = (pred.k, pred.y, code_to_layer(pred.layer));
+        while let Some((pred_anchor, _score)) =
+            self.bt_get(connect_to.0, connect_to.1, connect_to.2.clone())
+        {
             assert!(pred_anchor != connect_to);
             connect_to = pred_anchor;
             anchors.push(connect_to.clone());
