@@ -3,6 +3,34 @@ use rustc_hash::FxHashMap;
 
 use std::cmp::{max, min};
 
+fn gap_affine_score(t_aln: &str, q_aln: &str, mismatch: i32, open: i32, ext: i32) -> i32 {
+    let tb = t_aln.as_bytes();
+    let qb = q_aln.as_bytes();
+    let mut score = 0i32;
+    let mut in_gap_t = false;
+    let mut in_gap_q = false;
+    for i in 0..tb.len() {
+        let t_gap = tb[i] == b'-';
+        let q_gap = qb[i] == b'-';
+        if t_gap {
+            score += if in_gap_t { ext } else { open + ext };
+            in_gap_t = true;
+            in_gap_q = false;
+        } else if q_gap {
+            score += if in_gap_q { ext } else { open + ext };
+            in_gap_q = true;
+            in_gap_t = false;
+        } else {
+            if tb[i] != qb[i] {
+                score += mismatch;
+            }
+            in_gap_t = false;
+            in_gap_q = false;
+        }
+    }
+    score
+}
+
 #[derive(Default)]
 struct WaveFront {
     s_k_to_y_map: FxHashMap<(i32, i32), u32>,
@@ -15,7 +43,7 @@ pub enum AlnLayer {
     Match,
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Eq, PartialEq, Debug)]
 pub enum WaveFrontStepResult {
     ReachMaxScore,
     ReachEnd,
@@ -373,6 +401,7 @@ impl<'a> WaveFronts<'a> {
 
     fn reduce(&mut self) {
         let (kmin, kmax) = *self.match_layer.score_to_k_range.get(&self.score).unwrap();
+        let k_end = self.query_str.len() as i32 - self.target_str.len() as i32;
         debug!("reduce, kmin-kmax: ({}):({}), {}", kmin, kmax, kmax - kmin);
         if (kmax - kmin) as u32 > self.max_wf_length {
             let mut dmin = usize::MAX;
@@ -399,6 +428,10 @@ impl<'a> WaveFronts<'a> {
                 dmin = min(dmin, max_d);
             });
 
+            if kdist.is_empty() {
+                return;
+            }
+
             let mut new_kmin = kmin;
             while new_kmin < kmax - 1 {
                 if !kdist.contains_key(&new_kmin) {
@@ -418,10 +451,18 @@ impl<'a> WaveFronts<'a> {
                     continue;
                 }
                 if *kdist.get(&new_kmax).unwrap() - dmin <= self.max_wf_length as usize {
+                    new_kmax += 1;
                     break;
                 }
                 new_kmax -= 1;
             }
+
+            // Never prune the target diagonal — the optimal path must end
+            // there. Without this, reduce() can drift the range far from k_end
+            // and leave the algorithm unable to close out the alignment.
+            let new_kmin = min(new_kmin, k_end);
+            let new_kmax = max(new_kmax, k_end + 1);
+
             debug!(
                 "score: {}, kmin:{}, kmax:{}, new_kmin:{}, new_kmax:{}",
                 self.score, kmin, kmax, new_kmin, new_kmax
@@ -486,17 +527,6 @@ impl<'a> WaveFronts<'a> {
         self.score += 1;
         self.next(self.score);
         self.reduce();
-        let (k_min, k_max) = self.match_layer.score_to_k_range.get(&self.score).unwrap();
-        debug!(
-            "k_min, k_max: {} {} {}",
-            k_min,
-            k_max,
-            (self.query_str.len() as i32 - self.target_str.len() as i32)
-        );
-        if min(k_max.abs(), k_min.abs()) as usize > max(self.query_str.len(), self.target_str.len())
-        {
-            return WaveFrontStepResult::Fail;
-        }
         debug!("score: {}", self.score);
         debug!("---");
         if let Some(max_score) = max_score {
@@ -511,7 +541,7 @@ impl<'a> WaveFronts<'a> {
     }
 
     pub fn step_all(&mut self, max_score: Option<i32>) -> WaveFrontStepResult {
-        loop {
+        let result = loop {
             match self.step_one(max_score) {
                 WaveFrontStepResult::Continue => {
                     continue;
@@ -520,7 +550,18 @@ impl<'a> WaveFronts<'a> {
                 WaveFrontStepResult::Fail => break WaveFrontStepResult::Fail,
                 WaveFrontStepResult::ReachEnd => break WaveFrontStepResult::ReachEnd,
             }
+        };
+        if result == WaveFrontStepResult::ReachEnd {
+            let (t_aln, q_aln) = self.backtrace();
+            self.score = gap_affine_score(
+                &t_aln,
+                &q_aln,
+                self.mismatch_penalty,
+                self.open_penalty,
+                self.extension_penalty,
+            );
         }
+        result
     }
 
     pub fn backtrace(&mut self) -> (String, String) {
@@ -584,52 +625,251 @@ impl<'a> WaveFronts<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use simple_logger::SimpleLogger;
+
+    fn score_alignment(t_aln: &str, q_aln: &str, mismatch: i32, open: i32, ext: i32) -> i32 {
+        assert_eq!(
+            t_aln.len(),
+            q_aln.len(),
+            "alignment strings must be equal length"
+        );
+        let tb = t_aln.as_bytes();
+        let qb = q_aln.as_bytes();
+        let mut score = 0i32;
+        let mut in_gap_t = false;
+        let mut in_gap_q = false;
+        for i in 0..tb.len() {
+            let t_gap = tb[i] == b'-';
+            let q_gap = qb[i] == b'-';
+            assert!(!(t_gap && q_gap), "all-gap column is invalid");
+            if t_gap {
+                score += if in_gap_t { ext } else { open + ext };
+                in_gap_t = true;
+                in_gap_q = false;
+            } else if q_gap {
+                score += if in_gap_q { ext } else { open + ext };
+                in_gap_q = true;
+                in_gap_t = false;
+            } else {
+                if tb[i] != qb[i] {
+                    score += mismatch;
+                }
+                in_gap_t = false;
+                in_gap_q = false;
+            }
+        }
+        score
+    }
+
+    fn assert_valid_alignment(t_str: &str, q_str: &str, t_aln: &str, q_aln: &str) {
+        assert_eq!(
+            t_aln.replace('-', ""),
+            t_str,
+            "target round-trip identity failed"
+        );
+        assert_eq!(
+            q_aln.replace('-', ""),
+            q_str,
+            "query round-trip identity failed"
+        );
+        assert_eq!(
+            t_aln.len(),
+            q_aln.len(),
+            "alignment strings differ in length"
+        );
+    }
+
+    fn run_alignment(
+        t_str: &str,
+        q_str: &str,
+        max_wf_length: u32,
+        mismatch: i32,
+        open: i32,
+        ext: i32,
+        max_score: Option<i32>,
+    ) -> (WaveFrontStepResult, Option<(String, String, i32)>) {
+        let cap = std::cmp::max(16, std::cmp::max(t_str.len(), q_str.len()) >> 5);
+        let mut wfs =
+            WaveFronts::new_with_capacity(t_str, q_str, max_wf_length, mismatch, open, ext, cap);
+        let result = wfs.step_all(max_score);
+        let aln = if result == WaveFrontStepResult::ReachEnd {
+            let score = wfs.score;
+            let (t_aln, q_aln) = wfs.backtrace();
+            Some((t_aln, q_aln, score))
+        } else {
+            None
+        };
+        (result, aln)
+    }
+
+    // Original regression fixtures, strengthened with invariant checks.
 
     #[test]
     fn test_step() {
-        SimpleLogger::new().init().unwrap_or_default();
         let t_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAATACATGAAAGTTGCATGAAACATACATGAAAAAAGTTGCATGAAACCCCATACATGAAAGTTGCATGAA";
         let q_str = "ACATACATGAAAAAAGTTGCATGAAAAAACATACATGAAAGTTGCATGAAACATACATGAAAAAAGTTGCAAAAGTTGCATGAAACATACATGAAAATGAAAAAACATACATGAAAGTTGCATGAA";
-        let capacity = std::cmp::max(1024, std::cmp::max(t_str.len(), q_str.len()) >> 5);
-        let mut wfs = WaveFronts::new_with_capacity(t_str, q_str, 40, 2, 2, 1, capacity);
-        if wfs.step_all(Some(1024)) == WaveFrontStepResult::ReachEnd {
-            let (t_aln_str, q_aln_str) = wfs.backtrace();
-            println!("{}", t_aln_str);
-            println!("{}", q_aln_str);
-        }
+        let (result, aln) = run_alignment(t_str, q_str, 40, 2, 2, 1, Some(1024));
+        assert_eq!(result, WaveFrontStepResult::ReachEnd);
+        let (t_aln, q_aln, score) = aln.unwrap();
+        assert_valid_alignment(t_str, q_str, &t_aln, &q_aln);
+        assert_eq!(score_alignment(&t_aln, &q_aln, 2, 2, 1), score);
     }
 
     #[test]
     fn test_step_2() {
-        SimpleLogger::new().init().unwrap_or_default();
         let t_str =
             "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAAAAAATGAAAGTTGCATGAAAATTTT";
         let q_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAAATGAAAGTAAAATGAAAGTTGCATGAATGAAATGGTACATACATGAAAGTTGCAGGGG";
         let len_diff = (t_str.len() as i32 - q_str.len() as i32).unsigned_abs();
-        let max_wf_length = len_diff;
-        let capacity = std::cmp::max(1024, std::cmp::max(t_str.len(), q_str.len()) >> 5);
-        let mut wfs = WaveFronts::new_with_capacity(t_str, q_str, max_wf_length, 9, 2, 1, capacity);
-        if wfs.step_all(Some(1024)) == WaveFrontStepResult::ReachEnd {
-            let (t_aln_str, q_aln_str) = wfs.backtrace();
-            println!("{}", t_aln_str);
-            println!("{}", q_aln_str);
-        }
+        let (result, aln) = run_alignment(t_str, q_str, len_diff, 9, 2, 1, Some(1024));
+        assert_eq!(result, WaveFrontStepResult::ReachEnd);
+        let (t_aln, q_aln, score) = aln.unwrap();
+        assert_valid_alignment(t_str, q_str, &t_aln, &q_aln);
+        assert_eq!(score_alignment(&t_aln, &q_aln, 9, 2, 1), score);
+    }
+
+    #[test]
+    fn test_step_2_large_wf() {
+        let t_str =
+            "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAAAAAATGAAAGTTGCATGAAAATTTT";
+        let q_str = "ACATACATGAAAAAAGTTGCATGAAACCCCAAAAGTTGCATGAAACATACATGAAAAATGAAAGTAAAATGAAAGTTGCATGAATGAAATGGTACATACATGAAAGTTGCAGGGG";
+        let (result, aln) = run_alignment(t_str, q_str, 256, 9, 2, 1, Some(1024));
+        assert_eq!(result, WaveFrontStepResult::ReachEnd);
+        let (t_aln, q_aln, score) = aln.unwrap();
+        assert_valid_alignment(t_str, q_str, &t_aln, &q_aln);
+        assert_eq!(score_alignment(&t_aln, &q_aln, 9, 2, 1), score);
     }
 
     #[test]
     fn test_step_3() {
-        SimpleLogger::new().init().unwrap_or_default();
         let t_str = "GAAAGACCTGAAAGATCACGGTGCCTTCATTTCAACTGTGAGACATGAAGTAATTTTCCCAAATCTACAACATTAAGATATGGTGCAATAAGGACCAGAT";
         let q_str = "CTCCAACACGAGATTACCCAACCCAGGAGCAAGGAAATCAGTAACTTCCTCCCTATAACTTGGAATGTGGGTGGAGGGGTTCATAGTTCTCCCTGAGTGA";
         let len_diff = (t_str.len() as i32 - q_str.len() as i32).unsigned_abs();
-        let max_wf_length = len_diff * 2;
-        let mut wfs =
-            WaveFronts::new_with_capacity(t_str, q_str, max_wf_length, 4, 2, 1, t_str.len() >> 4);
-        if wfs.step_all(Some(1024)) == WaveFrontStepResult::ReachEnd {
-            let (t_aln_str, q_aln_str) = wfs.backtrace();
-            println!("{}", t_aln_str);
-            println!("{}", q_aln_str);
-        }
+        let max_wf_length = len_diff.max(1) * 2;
+        let (result, aln) = run_alignment(t_str, q_str, max_wf_length, 4, 2, 1, Some(1024));
+        assert_eq!(result, WaveFrontStepResult::ReachEnd);
+        let (t_aln, q_aln, score) = aln.unwrap();
+        assert_valid_alignment(t_str, q_str, &t_aln, &q_aln);
+        assert_eq!(score_alignment(&t_aln, &q_aln, 4, 2, 1), score);
     }
+
+    #[test]
+    fn identical_sequences_score_zero() {
+        let s = "ACGTACGTACGTACGTACGTACGT";
+        let (result, aln) = run_alignment(s, s, 32, 4, 2, 1, Some(128));
+        assert_eq!(result, WaveFrontStepResult::ReachEnd);
+        let (t_aln, q_aln, score) = aln.unwrap();
+        assert_eq!(score, 0);
+        assert_eq!(t_aln, s);
+        assert_eq!(q_aln, s);
+    }
+
+    #[test]
+    fn single_char_match() {
+        let (result, aln) = run_alignment("A", "A", 4, 4, 2, 1, Some(32));
+        assert_eq!(result, WaveFrontStepResult::ReachEnd);
+        let (t_aln, q_aln, score) = aln.unwrap();
+        assert_eq!(score, 0);
+        assert_eq!(t_aln, "A");
+        assert_eq!(q_aln, "A");
+    }
+
+    #[test]
+    fn single_char_mismatch() {
+        let mismatch = 4;
+        let (result, aln) = run_alignment("A", "T", 4, mismatch, 2, 1, Some(32));
+        assert_eq!(result, WaveFrontStepResult::ReachEnd);
+        let (t_aln, q_aln, score) = aln.unwrap();
+        assert_valid_alignment("A", "T", &t_aln, &q_aln);
+        assert_eq!(score, mismatch);
+        assert_eq!(score_alignment(&t_aln, &q_aln, mismatch, 2, 1), score);
+    }
+
+    #[test]
+    fn empty_target_single_char_query() {
+        let open = 2;
+        let ext = 1;
+        let (result, aln) = run_alignment("", "A", 4, 4, open, ext, Some(32));
+        assert_eq!(result, WaveFrontStepResult::ReachEnd);
+        let (t_aln, q_aln, score) = aln.unwrap();
+        assert_valid_alignment("", "A", &t_aln, &q_aln);
+        assert_eq!(score, open + ext);
+        assert_eq!(score_alignment(&t_aln, &q_aln, 4, open, ext), score);
+    }
+
+    #[test]
+    fn empty_query_single_char_target() {
+        let open = 2;
+        let ext = 1;
+        let (result, aln) = run_alignment("A", "", 4, 4, open, ext, Some(32));
+        assert_eq!(result, WaveFrontStepResult::ReachEnd);
+        let (t_aln, q_aln, score) = aln.unwrap();
+        assert_valid_alignment("A", "", &t_aln, &q_aln);
+        assert_eq!(score, open + ext);
+        assert_eq!(score_alignment(&t_aln, &q_aln, 4, open, ext), score);
+    }
+
+    // Targets the reduce() off-by-one: a tight max_wf_length forces pruning to
+    // fire. If the far edge diagonal is silently discarded, the run fails or
+    // produces a wrong score. A single 4-base insertion should score open+4*ext.
+    #[test]
+    fn tight_max_wf_length_preserves_correctness() {
+        let t_str = "ACGTACGTACGTACGTACGTACGT";
+        let q_str = "ACGTACGTACGTACGTACGTACGTACGT";
+        let len_diff = (q_str.len() - t_str.len()) as u32;
+        let (result, aln) = run_alignment(t_str, q_str, len_diff, 4, 2, 1, Some(64));
+        assert_eq!(result, WaveFrontStepResult::ReachEnd);
+        let (t_aln, q_aln, score) = aln.unwrap();
+        assert_valid_alignment(t_str, q_str, &t_aln, &q_aln);
+        assert_eq!(score, 2 + 4);
+        assert_eq!(score_alignment(&t_aln, &q_aln, 4, 2, 1), score);
+    }
+
+    #[test]
+    fn reach_max_score_when_below_optimal() {
+        let t_str = "AAAAAAAAAA";
+        let q_str = "TTTTTTTTTT";
+        let (result, aln) = run_alignment(t_str, q_str, 8, 4, 2, 1, Some(5));
+        assert_eq!(result, WaveFrontStepResult::ReachMaxScore);
+        assert!(aln.is_none());
+    }
+
+    #[test]
+    fn repeated_runs_are_deterministic() {
+        let t_str = "ACGTACGTACGTACGTACGT";
+        let q_str = "ACGTACGTAAAACGTACGTACGT";
+        let (_, a1) = run_alignment(t_str, q_str, 16, 4, 2, 1, Some(64));
+        let (_, a2) = run_alignment(t_str, q_str, 16, 4, 2, 1, Some(64));
+        let (t1, q1, s1) = a1.unwrap();
+        let (t2, q2, s2) = a2.unwrap();
+        assert_eq!(s1, s2);
+        assert_eq!(t1, t2);
+        assert_eq!(q1, q2);
+    }
+
+    #[test]
+    fn asymmetric_length_with_clean_indel_large_wf() {
+        let t_str = "ACGTACGTACGTACGTACGTACGTACGTACGT";
+        let q_str = "ACGTACGTACGTACGTGGGGGGGGGGGGGGGGGGGGACGTACGTACGTACGT";
+        let max_wf_length = 256;
+        let (result, aln) = run_alignment(t_str, q_str, max_wf_length, 4, 2, 1, Some(256));
+        assert_eq!(result, WaveFrontStepResult::ReachEnd);
+        let (t_aln, q_aln, score) = aln.unwrap();
+        assert_valid_alignment(t_str, q_str, &t_aln, &q_aln);
+        assert_eq!(score_alignment(&t_aln, &q_aln, 4, 2, 1), score);
+        assert_eq!(score, 2 + 20);
+    }
+
+    #[test]
+    fn asymmetric_length_with_clean_indel_tight_wf() {
+        let t_str = "ACGTACGTACGTACGTACGTACGTACGTACGT";
+        let q_str = "ACGTACGTACGTACGTGGGGGGGGGGGGGGGGGGGGACGTACGTACGTACGT";
+        let len_diff = (q_str.len() - t_str.len()) as u32;
+        let max_wf_length = len_diff + 8;
+        let (result, aln) = run_alignment(t_str, q_str, max_wf_length, 4, 2, 1, Some(256));
+        assert_eq!(result, WaveFrontStepResult::ReachEnd);
+        let (t_aln, q_aln, score) = aln.unwrap();
+        assert_valid_alignment(t_str, q_str, &t_aln, &q_aln);
+        assert_eq!(score_alignment(&t_aln, &q_aln, 4, 2, 1), score);
+    }
+
 }
