@@ -2,6 +2,12 @@
 
 ## 0.2.0
 
+### Performance
+
+- **Flat-`Vec` storage for the two hot data structures.** `s_k_to_y` is now a `Vec<Vec<u32>>` (outer indexed by `score`, inner a fixed-width window of size `t_len + q_len + 3` indexed by `k + k_offset`, with sentinel `u32::MAX` for absent). `score_to_k_range` is a `Vec<Option<(i32, i32)>>` indexed by `score`. Both replace `FxHashMap`, removing hash overhead from the inner loop of `next()`, `advance()`, and `reduce()` — the hottest paths in the algorithm. Out-of-window reads (e.g. `k±1` at the boundary) return `None` as before; writes are guaranteed in-window by the existing `x ≤ t_len && y ≤ q_len` guard.
+- **`advance()` takes `&[u8]` directly.** `step_one()` passes `target_str.as_bytes()` / `query_str.as_bytes()` once per step instead of shadowing inside the inner loop.
+- **Dead code removed during the rewrite.** The `if e.1 > score` branch in the insert/delete blocks (unreachable given monotonic `score`) and the asymmetric `is_none()` guard on the match block collapsed into single `entry(...).or_insert(...)` / `contains_key(...)` calls.
+
 ### Bug fixes
 
 - **`reduce()` off-by-one on the upper-bound search.** The farthest-right passing diagonal was silently excluded from the reduced k-range because the half-open upper bound wasn't made exclusive after a passing break. Fixed by `new_kmax += 1` on the passing-break path.

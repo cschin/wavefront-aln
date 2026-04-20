@@ -3,6 +3,10 @@ use rustc_hash::FxHashMap;
 
 use std::cmp::{max, min};
 
+/// Sentinel value used in the flat `s_k_to_y` Vec to mean "no entry". Chosen
+/// so it can never collide with a real `y` (which is bounded by `q_len`).
+const SENTINEL: u32 = u32::MAX;
+
 fn gap_affine_score(t_aln: &str, q_aln: &str, mismatch: i32, open: i32, ext: i32) -> i32 {
     let tb = t_aln.as_bytes();
     let qb = q_aln.as_bytes();
@@ -31,10 +35,16 @@ fn gap_affine_score(t_aln: &str, q_aln: &str, mismatch: i32, open: i32, ext: i32
     score
 }
 
-#[derive(Default)]
+/// Dense, score-major storage for one wavefront layer. Both maps are flat Vecs
+/// indexed by `score` (outer) and `k + k_offset` (inner); missing entries use
+/// the `SENTINEL` value or `None`, avoiding the hash overhead of FxHashMap on
+/// the hot path.
 struct WaveFront {
-    s_k_to_y_map: FxHashMap<(i32, i32), u32>,
-    score_to_k_range: FxHashMap<i32, (i32, i32)>,
+    // s_k_to_y[score as usize][(k + k_offset) as usize] = y or SENTINEL
+    s_k_to_y: Vec<Vec<u32>>,
+    score_to_k_range: Vec<Option<(i32, i32)>>,
+    k_width: usize,
+    k_offset: i32,
 }
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub enum AlnLayer {
@@ -68,31 +78,90 @@ type Anchor = (i32, u32, AlnLayer);
 type Connection = (Anchor, Anchor); // Connection.0 is the best score at the end point
 
 impl WaveFront {
-    fn new() -> Self {
-        let mut wf = WaveFront::default();
-        wf.score_to_k_range.insert(0, (0, 1));
-        wf
-    }
-
-    fn new_with_capacity(capacity: usize) -> Self {
-        let s_k_to_y_map = FxHashMap::with_capacity_and_hasher(capacity * 64, Default::default());
-        let score_to_k_range = FxHashMap::with_capacity_and_hasher(capacity, Default::default());
+    fn new_with_capacity(t_len: usize, q_len: usize, capacity: usize) -> Self {
+        // k = y - x with y ∈ [0, q_len] and x ∈ [0, t_len] gives
+        // k ∈ [-t_len, q_len]. Add a 1-slot margin on each side so reads at
+        // k-1 / k+1 from boundary diagonals stay in-bounds instead of needing
+        // extra conditionals in the hot loop.
+        let k_offset = t_len as i32 + 1;
+        let k_width = t_len + q_len + 3;
         let mut wf = WaveFront {
-            s_k_to_y_map,
-            score_to_k_range,
+            s_k_to_y: Vec::with_capacity(capacity),
+            score_to_k_range: Vec::with_capacity(capacity),
+            k_width,
+            k_offset,
         };
-        wf.score_to_k_range.insert(0, (0, 1));
+        wf.set_range(0, (0, 1));
         wf
     }
 
-    fn advance<'a>(&mut self, t: &'a str, q: &'a str, score: i32) -> Vec<(Connection, i32)> {
+    #[inline]
+    fn k_idx(&self, k: i32) -> Option<usize> {
+        let idx = k + self.k_offset;
+        if idx < 0 || (idx as usize) >= self.k_width {
+            None
+        } else {
+            Some(idx as usize)
+        }
+    }
+
+    fn ensure_score(&mut self, score: i32) {
+        if score < 0 {
+            return;
+        }
+        let s = score as usize;
+        while self.s_k_to_y.len() <= s {
+            self.s_k_to_y.push(vec![SENTINEL; self.k_width]);
+        }
+        while self.score_to_k_range.len() <= s {
+            self.score_to_k_range.push(None);
+        }
+    }
+
+    #[inline]
+    fn get_y(&self, score: i32, k: i32) -> Option<u32> {
+        if score < 0 {
+            return None;
+        }
+        let row = self.s_k_to_y.get(score as usize)?;
+        let i = self.k_idx(k)?;
+        let y = row[i];
+        if y == SENTINEL {
+            None
+        } else {
+            Some(y)
+        }
+    }
+
+    fn set_y(&mut self, score: i32, k: i32, y: u32) {
+        self.ensure_score(score);
+        let s = score as usize;
+        let i = self.k_idx(k).expect("k out of bounds in set_y");
+        self.s_k_to_y[s][i] = y;
+    }
+
+    #[inline]
+    fn get_range(&self, score: i32) -> Option<(i32, i32)> {
+        if score < 0 {
+            return None;
+        }
+        self.score_to_k_range
+            .get(score as usize)
+            .copied()
+            .flatten()
+    }
+
+    fn set_range(&mut self, score: i32, range: (i32, i32)) {
+        self.ensure_score(score);
+        self.score_to_k_range[score as usize] = Some(range);
+    }
+
+    fn advance(&mut self, t: &[u8], q: &[u8], score: i32) -> Vec<(Connection, i32)> {
         debug!("advance score: {}", score);
-        let q = q.as_bytes();
-        let t = t.as_bytes();
-        let &(k_min, k_max) = self.score_to_k_range.get(&score).expect("no range");
+        let (k_min, k_max) = self.get_range(score).expect("no range");
         (k_min..k_max)
             .filter_map(|k| {
-                if let Some(&y) = self.s_k_to_y_map.get(&(score, k)) {
+                if let Some(y) = self.get_y(score, k) {
                     let mut xs = (y as i32 - k) as usize; // k = y - x
                     let mut ys = y as usize;
                     loop {
@@ -104,8 +173,7 @@ impl WaveFront {
                     }
                     debug!("advance: k:{} y: {} -> {}", k, y, ys);
                     if ys > y as usize {
-                        self.s_k_to_y_map.insert((score, k), ys as u32);
-
+                        self.set_y(score, k, ys as u32);
                         Some((
                             ((k, ys as u32, AlnLayer::Match), (k, y, AlnLayer::Match)),
                             score,
@@ -117,7 +185,7 @@ impl WaveFront {
                     None
                 }
             })
-            .collect::<Vec<_>>()
+            .collect()
     }
 }
 
@@ -130,24 +198,15 @@ impl<'a> WaveFronts<'a> {
         open_penalty: i32,
         extension_penalty: i32,
     ) -> Self {
-        let insertion_layer = WaveFront::new();
-        let deletion_layer = WaveFront::new();
-        let mut match_layer = WaveFront::new();
-        match_layer.s_k_to_y_map.insert((0, 0), 0);
-
-        WaveFronts {
-            target_str: t_str,
-            query_str: q_str,
-            insertion_layer,
-            deletion_layer,
-            match_layer,
+        Self::new_with_capacity(
+            t_str,
+            q_str,
             max_wf_length,
             mismatch_penalty,
             open_penalty,
             extension_penalty,
-            score: 0,
-            backtrace_map: FxHashMap::default(),
-        }
+            0,
+        )
     }
 
     pub fn new_with_capacity(
@@ -159,10 +218,12 @@ impl<'a> WaveFronts<'a> {
         extension_penalty: i32,
         capacity: usize,
     ) -> Self {
-        let insertion_layer = WaveFront::new_with_capacity(capacity);
-        let deletion_layer = WaveFront::new_with_capacity(capacity);
-        let mut match_layer = WaveFront::new_with_capacity(capacity);
-        match_layer.s_k_to_y_map.insert((0, 0), 0);
+        let t_len = t_str.len();
+        let q_len = q_str.len();
+        let insertion_layer = WaveFront::new_with_capacity(t_len, q_len, capacity);
+        let deletion_layer = WaveFront::new_with_capacity(t_len, q_len, capacity);
+        let mut match_layer = WaveFront::new_with_capacity(t_len, q_len, capacity);
+        match_layer.set_y(0, 0, 0);
 
         WaveFronts {
             target_str: t_str,
@@ -180,125 +241,67 @@ impl<'a> WaveFronts<'a> {
     }
 
     pub fn next(&mut self, score: i32) {
-        let (match_k_min, match_k_max) = *self
+        let (match_k_min, match_k_max) = self
             .match_layer
-            .score_to_k_range
-            .get(&(score - self.mismatch_penalty))
-            .unwrap_or(&(0, 1));
+            .get_range(score - self.mismatch_penalty)
+            .unwrap_or((0, 1));
 
-        let (open_k_min, open_k_max) = *self
+        let (open_k_min, open_k_max) = self
             .match_layer
-            .score_to_k_range
-            .get(&(score - self.open_penalty - self.extension_penalty))
-            .unwrap_or(&(0, 1));
+            .get_range(score - self.open_penalty - self.extension_penalty)
+            .unwrap_or((0, 1));
 
-        let (i_k_min, i_k_max) = *self
+        let (i_k_min, i_k_max) = self
             .insertion_layer
-            .score_to_k_range
-            .get(&(score - self.extension_penalty))
-            .unwrap_or(&(0, 1));
+            .get_range(score - self.extension_penalty)
+            .unwrap_or((0, 1));
 
-        let (d_k_min, d_k_max) = *self
+        let (d_k_min, d_k_max) = self
             .deletion_layer
-            .score_to_k_range
-            .get(&(score - self.extension_penalty))
-            .unwrap_or(&(0, 1));
+            .get_range(score - self.extension_penalty)
+            .unwrap_or((0, 1));
 
         let k_max = max(match_k_max, max(open_k_max, max(i_k_max, d_k_max))) + 1;
         let k_min = min(match_k_min, min(open_k_min, min(i_k_min, d_k_min))) - 1;
         debug!("score:{} k_min:{}, k_max:{}", score, k_min, k_max);
-        self.insertion_layer
-            .score_to_k_range
-            .insert(score, (k_min, k_max));
-        self.deletion_layer
-            .score_to_k_range
-            .insert(score, (k_min, k_max));
-        self.match_layer
-            .score_to_k_range
-            .insert(score, (k_min, k_max));
+        self.insertion_layer.set_range(score, (k_min, k_max));
+        self.deletion_layer.set_range(score, (k_min, k_max));
+        self.match_layer.set_range(score, (k_min, k_max));
+
+        let t_len = self.target_str.len();
+        let q_len = self.query_str.len();
 
         (k_min..k_max).for_each(|k| {
             debug!("k: {:?}", k);
 
+            // Insert: extend query (y advances, x stays).
             let e1 = self
                 .match_layer
-                .s_k_to_y_map
-                .get(&(score - self.open_penalty - self.extension_penalty, k - 1));
-
+                .get_y(score - self.open_penalty - self.extension_penalty, k - 1);
             let e2 = self
                 .insertion_layer
-                .s_k_to_y_map
-                .get(&(score - self.extension_penalty, k - 1));
+                .get_y(score - self.extension_penalty, k - 1);
 
             let connection = match (e1, e2) {
                 (Some(y1), None) => Some((
-                    score,
-                    (k, *y1 + 1, AlnLayer::Insert),
-                    (k - 1, *y1, AlnLayer::Match),
+                    (k, y1 + 1, AlnLayer::Insert),
+                    (k - 1, y1, AlnLayer::Match),
                 )),
                 (None, Some(y2)) => Some((
-                    score,
-                    (k, *y2 + 1, AlnLayer::Insert),
-                    (k - 1, *y2, AlnLayer::Insert),
+                    (k, y2 + 1, AlnLayer::Insert),
+                    (k - 1, y2, AlnLayer::Insert),
                 )),
                 (Some(y1), Some(y2)) => {
-                    if *y1 >= *y2 {
+                    if y1 >= y2 {
                         Some((
-                            score,
-                            (k, *y1 + 1, AlnLayer::Insert),
-                            (k - 1, *y1, AlnLayer::Match),
+                            (k, y1 + 1, AlnLayer::Insert),
+                            (k - 1, y1, AlnLayer::Match),
                         ))
                     } else {
                         Some((
-                            score,
-                            (k, *y2 + 1, AlnLayer::Insert),
-                            (k - 1, *y2, AlnLayer::Insert),
+                            (k, y2 + 1, AlnLayer::Insert),
+                            (k - 1, y2, AlnLayer::Insert),
                         ))
-                    }
-                }
-                (None, None) => None,
-            };
-
-            if let Some((score, connection_to, connection_from)) = connection {
-                let x = (connection_to.1 as i32 - connection_to.0) as usize;
-                let y = connection_to.1 as usize;
-                if x <= self.target_str.len() && y <= self.query_str.len() {
-                    self.insertion_layer
-                        .s_k_to_y_map
-                        .insert((score, k), connection_to.1);
-                    let e = self
-                        .backtrace_map
-                        .entry(connection_to.clone())
-                        .or_insert((connection_from.clone(), score));
-                    if e.1 > score {
-                        assert!(connection_to != connection_from);
-                        self.backtrace_map
-                            .insert(connection_to, (connection_from, score));
-                    }
-                }
-            };
-
-            let e1 = self
-                .match_layer
-                .s_k_to_y_map
-                .get(&(score - self.open_penalty - self.extension_penalty, k + 1));
-
-            let e2 = self
-                .deletion_layer
-                .s_k_to_y_map
-                .get(&(score - self.extension_penalty, k + 1));
-            let connection = match (e1, e2) {
-                (Some(y1), None) => {
-                    Some(((k, *y1, AlnLayer::Delete), (k + 1, *y1, AlnLayer::Match)))
-                }
-                (None, Some(y2)) => {
-                    Some(((k, *y2, AlnLayer::Delete), (k + 1, *y2, AlnLayer::Delete)))
-                }
-                (Some(y1), Some(y2)) => {
-                    if *y1 >= *y2 {
-                        Some(((k, *y1, AlnLayer::Delete), (k + 1, *y1, AlnLayer::Match)))
-                    } else {
-                        Some(((k, *y2, AlnLayer::Delete), (k + 1, *y2, AlnLayer::Delete)))
                     }
                 }
                 (None, None) => None,
@@ -307,122 +310,138 @@ impl<'a> WaveFronts<'a> {
             if let Some((connection_to, connection_from)) = connection {
                 let x = (connection_to.1 as i32 - connection_to.0) as usize;
                 let y = connection_to.1 as usize;
-                if x <= self.target_str.len() && y <= self.query_str.len() {
-                    self.deletion_layer
-                        .s_k_to_y_map
-                        .insert((score, k), connection_to.1);
-                    let e = self
-                        .backtrace_map
-                        .entry(connection_to.clone())
-                        .or_insert((connection_from.clone(), score));
-                    if e.1 > score {
-                        assert!(connection_to != connection_from);
-                        self.backtrace_map
-                            .insert(connection_to, (connection_from, score));
-                    }
+                if x <= t_len && y <= q_len {
+                    self.insertion_layer.set_y(score, k, connection_to.1);
+                    self.backtrace_map
+                        .entry(connection_to)
+                        .or_insert((connection_from, score));
                 }
-            };
+            }
 
+            // Delete: extend target (x advances, y stays).
             let e1 = self
                 .match_layer
-                .s_k_to_y_map
-                .get(&(score - self.mismatch_penalty, k));
-            let e2 = self.insertion_layer.s_k_to_y_map.get(&(score, k));
-            let e3 = self.deletion_layer.s_k_to_y_map.get(&(score, k));
+                .get_y(score - self.open_penalty - self.extension_penalty, k + 1);
+            let e2 = self
+                .deletion_layer
+                .get_y(score - self.extension_penalty, k + 1);
+            let connection = match (e1, e2) {
+                (Some(y1), None) => {
+                    Some(((k, y1, AlnLayer::Delete), (k + 1, y1, AlnLayer::Match)))
+                }
+                (None, Some(y2)) => {
+                    Some(((k, y2, AlnLayer::Delete), (k + 1, y2, AlnLayer::Delete)))
+                }
+                (Some(y1), Some(y2)) => {
+                    if y1 >= y2 {
+                        Some(((k, y1, AlnLayer::Delete), (k + 1, y1, AlnLayer::Match)))
+                    } else {
+                        Some(((k, y2, AlnLayer::Delete), (k + 1, y2, AlnLayer::Delete)))
+                    }
+                }
+                (None, None) => None,
+            };
+
+            if let Some((connection_to, connection_from)) = connection {
+                let x = (connection_to.1 as i32 - connection_to.0) as usize;
+                let y = connection_to.1 as usize;
+                if x <= t_len && y <= q_len {
+                    self.deletion_layer.set_y(score, k, connection_to.1);
+                    self.backtrace_map
+                        .entry(connection_to)
+                        .or_insert((connection_from, score));
+                }
+            }
+
+            // Match: mismatch on diagonal, or free close from Insert/Delete.
+            let e1 = self.match_layer.get_y(score - self.mismatch_penalty, k);
+            let e2 = self.insertion_layer.get_y(score, k);
+            let e3 = self.deletion_layer.get_y(score, k);
             let connection = match (e1, e2, e3) {
                 (Some(y1), None, None) => {
-                    Some(((k, *y1 + 1, AlnLayer::Match), (k, *y1, AlnLayer::Match)))
+                    Some(((k, y1 + 1, AlnLayer::Match), (k, y1, AlnLayer::Match)))
                 }
                 (None, Some(y2), None) => {
-                    Some(((k, *y2, AlnLayer::Match), (k, *y2, AlnLayer::Insert)))
+                    Some(((k, y2, AlnLayer::Match), (k, y2, AlnLayer::Insert)))
                 }
                 (None, None, Some(y3)) => {
-                    Some(((k, *y3, AlnLayer::Match), (k, *y3, AlnLayer::Delete)))
+                    Some(((k, y3, AlnLayer::Match), (k, y3, AlnLayer::Delete)))
                 }
-
                 (Some(y1), Some(y2), None) => {
-                    if *y1 + 1 >= *y2 {
-                        Some(((k, *y1 + 1, AlnLayer::Match), (k, *y1, AlnLayer::Match)))
+                    if y1 + 1 >= y2 {
+                        Some(((k, y1 + 1, AlnLayer::Match), (k, y1, AlnLayer::Match)))
                     } else {
-                        Some(((k, *y2, AlnLayer::Match), (k, *y2, AlnLayer::Insert)))
+                        Some(((k, y2, AlnLayer::Match), (k, y2, AlnLayer::Insert)))
                     }
                 }
                 (Some(y1), None, Some(y3)) => {
-                    if *y1 + 1 >= *y3 {
-                        Some(((k, *y1 + 1, AlnLayer::Match), (k, *y1, AlnLayer::Match)))
+                    if y1 + 1 >= y3 {
+                        Some(((k, y1 + 1, AlnLayer::Match), (k, y1, AlnLayer::Match)))
                     } else {
-                        Some(((k, *y3, AlnLayer::Match), (k, *y3, AlnLayer::Delete)))
+                        Some(((k, y3, AlnLayer::Match), (k, y3, AlnLayer::Delete)))
                     }
                 }
                 (None, Some(y2), Some(y3)) => {
-                    if *y2 >= *y3 {
-                        Some(((k, *y2, AlnLayer::Match), (k, *y2, AlnLayer::Insert)))
+                    if y2 >= y3 {
+                        Some(((k, y2, AlnLayer::Match), (k, y2, AlnLayer::Insert)))
                     } else {
-                        Some(((k, *y3, AlnLayer::Match), (k, *y3, AlnLayer::Delete)))
+                        Some(((k, y3, AlnLayer::Match), (k, y3, AlnLayer::Delete)))
                     }
                 }
-
                 (Some(y1), Some(y2), Some(y3)) => {
-                    if *y1 + 1 >= *y2 && *y1 + 1 >= *y3 {
-                        Some(((k, *y1 + 1, AlnLayer::Match), (k, *y1, AlnLayer::Match)))
-                    } else if *y2 >= *y3 {
-                        Some(((k, *y2, AlnLayer::Match), (k, *y2, AlnLayer::Insert)))
+                    if y1 + 1 >= y2 && y1 + 1 >= y3 {
+                        Some(((k, y1 + 1, AlnLayer::Match), (k, y1, AlnLayer::Match)))
+                    } else if y2 >= y3 {
+                        Some(((k, y2, AlnLayer::Match), (k, y2, AlnLayer::Insert)))
                     } else {
-                        Some(((k, *y3, AlnLayer::Match), (k, *y3, AlnLayer::Delete)))
+                        Some(((k, y3, AlnLayer::Match), (k, y3, AlnLayer::Delete)))
                     }
                 }
-
                 (None, None, None) => None,
             };
 
             if let Some((connection_to, connection_from)) = connection {
-                if self.backtrace_map.get(&connection_to).is_none() {
+                if !self.backtrace_map.contains_key(&connection_to) {
                     let x = (connection_to.1 as i32 - connection_to.0) as usize;
                     let y = connection_to.1 as usize;
-                    if x <= self.target_str.len() && y <= self.query_str.len() {
-                        self.match_layer
-                            .s_k_to_y_map
-                            .insert((score, k), connection_to.1);
-                        let e = self
-                            .backtrace_map
-                            .entry(connection_to.clone())
-                            .or_insert((connection_from.clone(), score));
-
-                        if e.1 > score {
-                            assert!(connection_to != connection_from);
-                            self.backtrace_map
-                                .insert(connection_to, (connection_from, score));
-                        }
+                    if x <= t_len && y <= q_len {
+                        self.match_layer.set_y(score, k, connection_to.1);
+                        self.backtrace_map
+                            .insert(connection_to, (connection_from, score));
                     }
                 }
-            };
+            }
         })
     }
 
     fn reduce(&mut self) {
-        let (kmin, kmax) = *self.match_layer.score_to_k_range.get(&self.score).unwrap();
+        let (kmin, kmax) = self
+            .match_layer
+            .get_range(self.score)
+            .expect("match-layer range missing at self.score");
         let k_end = self.query_str.len() as i32 - self.target_str.len() as i32;
         debug!("reduce, kmin-kmax: ({}):({}), {}", kmin, kmax, kmax - kmin);
         if (kmax - kmin) as u32 > self.max_wf_length {
             let mut dmin = usize::MAX;
             let mut kdist = FxHashMap::<i32, usize>::default();
 
+            let t_len = self.target_str.len();
+            let q_len = self.query_str.len();
+
             (kmin..kmax).for_each(|k| {
-                debug!("score: {}, k: {}", self.score, k);
-                if !self.match_layer.s_k_to_y_map.contains_key(&(self.score, k)) {
+                let Some(y) = self.match_layer.get_y(self.score, k) else {
+                    return;
+                };
+                let y = y as usize;
+                if y > q_len {
                     return;
                 }
-                let y = *self.match_layer.s_k_to_y_map.get(&(self.score, k)).unwrap() as usize;
-                if y > self.query_str.len() {
-                    return;
-                }
-                debug!("query: {} y: {}\n", self.query_str.len(), y);
-                let dy = self.query_str.len() - y;
+                let dy = q_len - y;
                 let x = (y as i32 - k) as usize;
-                if x > self.target_str.len() {
+                if x > t_len {
                     return;
                 }
-                let dx = self.target_str.len() - x;
+                let dx = t_len - x;
                 let max_d = max(dx, dy);
                 kdist.insert(k, max_d);
                 dmin = min(dmin, max_d);
@@ -468,41 +487,27 @@ impl<'a> WaveFronts<'a> {
                 self.score, kmin, kmax, new_kmin, new_kmax
             );
 
-            *self
-                .match_layer
-                .score_to_k_range
-                .get_mut(&self.score)
-                .unwrap() = (new_kmin, new_kmax);
+            self.match_layer.set_range(self.score, (new_kmin, new_kmax));
 
-            let (i_kmin, i_kmax) = *self
-                .insertion_layer
-                .score_to_k_range
-                .get(&self.score)
-                .unwrap();
+            let (i_kmin, i_kmax) = self.insertion_layer.get_range(self.score).unwrap();
+            self.insertion_layer.set_range(
+                self.score,
+                (max(new_kmin, i_kmin), min(new_kmax, i_kmax)),
+            );
 
-            *self
-                .insertion_layer
-                .score_to_k_range
-                .get_mut(&self.score)
-                .unwrap() = (max(new_kmin, i_kmin), min(new_kmax, i_kmax));
-
-            let (d_kmin, d_kmax) = *self
-                .deletion_layer
-                .score_to_k_range
-                .get(&self.score)
-                .unwrap();
-
-            *self
-                .deletion_layer
-                .score_to_k_range
-                .get_mut(&self.score)
-                .unwrap() = (max(new_kmin, d_kmin), min(new_kmax, d_kmax));
+            let (d_kmin, d_kmax) = self.deletion_layer.get_range(self.score).unwrap();
+            self.deletion_layer.set_range(
+                self.score,
+                (max(new_kmin, d_kmin), min(new_kmax, d_kmax)),
+            );
         }
     }
 
     fn step_one(&mut self, max_score: Option<i32>) -> WaveFrontStepResult {
-        self.match_layer
-            .advance(self.target_str, self.query_str, self.score)
+        let t_bytes = self.target_str.as_bytes();
+        let q_bytes = self.query_str.as_bytes();
+        let advances = self.match_layer.advance(t_bytes, q_bytes, self.score);
+        advances
             .into_iter()
             .for_each(|((connection_to, connection_from), score)| {
                 if let Some(e) = self.backtrace_map.get(&connection_to) {
@@ -515,11 +520,9 @@ impl<'a> WaveFronts<'a> {
                         .insert(connection_to, (connection_from, score));
                 }
             });
-        if let Some(y) = self.match_layer.s_k_to_y_map.get(&(
-            self.score,
-            self.query_str.len() as i32 - self.target_str.len() as i32,
-        )) {
-            if *y as usize >= self.query_str.len() {
+        let k_end = self.query_str.len() as i32 - self.target_str.len() as i32;
+        if let Some(y) = self.match_layer.get_y(self.score, k_end) {
+            if y as usize >= self.query_str.len() {
                 return WaveFrontStepResult::ReachEnd;
             }
         }
